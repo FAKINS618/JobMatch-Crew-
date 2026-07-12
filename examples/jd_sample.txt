@@ -1,0 +1,14 @@
+岗位：Python AI 应用开发实习生
+
+岗位职责：
+1. 参与大模型应用开发，包括 Prompt 调优、API 接入和业务功能实现。
+2. 使用 Python / FastAPI 开发后端接口。
+3. 参与 Agent、RAG、知识库问答等 AI 应用功能建设。
+4. 配合前端和产品完成原型开发和接口联调。
+
+岗位要求：
+1. 熟悉 Python 基础语法和常用库。
+2. 了解 FastAPI 或 Flask。
+3. 熟悉大模型 API 调用，有 Prompt 工程经验。
+4. 了解 LangChain、Agent、Tools、Memory、RAG 更佳。
+5. 了解 Git、Docker、Apifox 等工程工具。

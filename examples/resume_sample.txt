@@ -1,0 +1,5 @@
+我学习过 Python 基础、面向对象、文件处理、HTTP 协议、爬虫、Pandas、Matplotlib、FastAPI、DeepSeek API、Prompt 工程、LangChain Agent、Tools、Memory、Apifox。
+
+我做过 Streamlit AI 小应用，可以调用大模型 API 完成文本生成和问答。
+
+我正在开发一个基于 CrewAI 的多 Agent 求职助手，使用 FastAPI 提供接口，Pydantic 定义请求和响应结构，Apifox 调试接口，后续计划使用 Docker 部署。

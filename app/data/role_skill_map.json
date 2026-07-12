@@ -1,0 +1,12 @@
+{
+  "AI 应用开发实习": {
+    "core_skills": ["Python", "FastAPI", "大模型 API", "Prompt 工程", "CrewAI", "RAG", "Docker"],
+    "project_keywords": ["智能问答", "知识库问答", "多 Agent", "简历分析", "工具调用"],
+    "learning_priority": ["FastAPI 接口开发", "LLM API 调用", "结构化输出", "RAG 知识库", "Docker 部署"]
+  },
+  "Python 后端开发实习": {
+    "core_skills": ["Python", "FastAPI", "MySQL", "Redis", "SQLAlchemy", "RESTful API", "Docker"],
+    "project_keywords": ["用户系统", "权限认证", "后台管理", "日志系统"],
+    "learning_priority": ["FastAPI", "数据库设计", "Redis 缓存", "接口认证", "Docker 部署"]
+  }
+}

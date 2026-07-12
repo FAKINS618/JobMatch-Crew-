@@ -1,0 +1,27 @@
+import pytest
+
+from app.schemas import JobPost, ScoreDimension
+
+# 测 Schema 校验
+def test_score_dimension_rejects_score_greater_than_max():
+    with pytest.raises(ValueError):
+        ScoreDimension(name="Python", score=30, max_score=20)
+
+
+def test_score_dimension_accepts_valid_score():
+    item = ScoreDimension(name="FastAPI", score=15, max_score=20)
+
+    assert item.score == 15
+
+
+def test_job_post_default_values():
+    post = JobPost(title="Python 后端实习")
+
+    assert post.status == "unknown"
+    assert post.freshness_score == 0.5
+    assert post.fetched_at is not None
+
+
+def test_job_post_rejects_invalid_freshness_score():
+    with pytest.raises(ValueError):
+        JobPost(title="测试岗位", freshness_score=1.5)
