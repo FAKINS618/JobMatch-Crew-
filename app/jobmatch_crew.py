@@ -5,7 +5,12 @@ from app.prompt_loader import load_prompt
 from app.role_skill_repository import format_role_skill_map_for_prompt
 from app.schemas import JobMatchAnalysis
 
-def run_jobmatch_crew(resume_text: str, jd_text: str, target_role: str) -> tuple[JobMatchAnalysis | None, str]:
+def run_jobmatch_crew(
+    resume_text: str,
+    jd_text: str,
+    target_role: str,
+    evidence_context: str = "",
+) -> tuple[JobMatchAnalysis | None, str]:
     """运行多 Agent 分析流程。
 
     当前 DeepSeek/OpenAI-compatible 接口不支持 CrewAI 的 response_format
@@ -111,6 +116,10 @@ def run_jobmatch_crew(resume_text: str, jd_text: str, target_role: str) -> tuple
 
         对每一条岗位要求，分别区分关键词证据和语义相关证据。没有明确简历证据时，
         必须标记为 missing_evidence，不得因为岗位要求出现过就判定候选人具备该能力。
+
+        后端规则检索召回的候选证据如下。请将其作为待裁决材料，只有与岗位要求真正
+        相关的片段才能写入 semantic_evidence，不要把召回结果直接当成事实：
+        {evidence_context or '暂无规则召回证据。'}
 
         请参考以下面试题知识库生成更贴合的面试问题：
 

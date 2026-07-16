@@ -13,14 +13,14 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 button.secondary { background: #dbeafe; color: #1d4ed8; }
 button.text-button { background: transparent; color: #0f766e; padding-inline: 4px; }
 
-.app-shell { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100vh; }
-.side-nav { background: #102a43; color: #d7e3ef; display: flex; flex-direction: column; gap: 28px; padding: 24px 16px; }
+.app-shell { min-height: 100vh; }
+.side-nav { background: #102a43; color: #d7e3ef; display: flex; flex-direction: column; gap: 28px; height: 100vh; left: 0; overflow-y: auto; padding: 24px 16px; position: fixed; top: 0; width: 220px; z-index: 10; }
 .brand { color: #fff; font-size: 20px; font-weight: 800; text-decoration: none; }
 .side-nav nav { display: grid; gap: 6px; }
 .side-nav nav a { border-radius: 5px; color: #d7e3ef; padding: 9px 10px; text-decoration: none; }
 .side-nav nav a.router-link-active { background: #1f4f70; color: #fff; }
 .side-note { color: #9fb3c8; font-size: 13px; margin-top: auto; }
-.main-content { min-width: 0; }
+.main-content { height: 100vh; margin-left: 220px; min-width: 0; overflow-y: auto; }
 .workspace { margin: 0 auto; max-width: 1180px; padding: 42px 44px 64px; }
 .page-heading { align-items: end; display: flex; gap: 32px; justify-content: space-between; margin-bottom: 28px; }
 .page-heading h1 { font-size: 28px; margin: 0; }
@@ -101,12 +101,13 @@ progress { accent-color: #0f766e; height: 8px; width: 100%; }
 .job-detail > p { color: #52606d; max-height: 320px; overflow: auto; white-space: pre-wrap; }
 
 @media (max-width: 760px) {
-  .app-shell { display: block; }
-  .side-nav { flex-direction: row; gap: 12px; overflow-x: auto; padding: 14px 16px; }
+  .app-shell { min-height: 100vh; }
+  .side-nav { flex-direction: row; gap: 12px; height: auto; overflow-x: auto; overflow-y: hidden; padding: 14px 16px; position: sticky; width: 100%; }
   .brand { flex-shrink: 0; white-space: nowrap; }
   .side-nav nav { display: flex; flex-shrink: 0; min-width: max-content; }
   .side-nav nav a { white-space: nowrap; }
   .side-note { display: none; }
+  .main-content { height: auto; margin-left: 0; overflow: visible; }
   .workspace { padding: 28px 18px; }
   .page-heading, .intake-grid, .composer, .evidence-item, .inbox-layout { display: grid; grid-template-columns: 1fr; }
   .page-heading { gap: 8px; }

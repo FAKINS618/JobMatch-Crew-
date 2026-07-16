@@ -17,23 +17,12 @@ from app.report_parser import extract_json_block
 from app.report_renderer import render_markdown_report
 from app.jobmatch_crew import run_jobmatch_crew
 from app.llm_factory import build_llm
+from app.rag.resume_retriever import requirement_query, retrieve_resume_chunks
 from app.schemas import ActionPlanItem, JobMatchAnalysis, RequirementMatch, ScoreDimension
 from app.services.market_profile_service import SKILL_KEYWORDS
 
 
 logger = logging.getLogger(__name__)
-
-
-SEMANTIC_SKILL_ALIASES: dict[str, tuple[str, ...]] = {
-    "FastAPI": ("异步接口", "后端接口", "web api"),
-    "RESTful API": ("接口设计", "服务端接口", "api 接口"),
-    "MySQL": ("关系型数据库", "sql 数据库"),
-    "Redis": ("缓存", "分布式缓存"),
-    "Docker": ("容器化", "容器部署"),
-    "RAG": ("检索增强", "知识库问答"),
-    "大模型 API": ("大语言模型", "llm", "openai", "deepseek"),
-    "Prompt": ("提示词", "提示工程"),
-}
 
 
 def _build_fit_strategy(score: int | None, missing_skills: list[str]) -> dict:
@@ -103,15 +92,23 @@ def _build_requirement_matches(resume_text: str, jd_text: str) -> list[Requireme
         semantic_evidence = []
         if skill.lower() in resume_lower:
             keyword_evidence.append(_evidence_snippet(resume_text, skill))
-        for alias in SEMANTIC_SKILL_ALIASES.get(skill, ()):
-            if alias.lower() in resume_lower and not keyword_evidence:
-                semantic_evidence.append(_evidence_snippet(resume_text, alias))
+        vector_chunks = []
+        if not keyword_evidence:
+            vector_chunks = retrieve_resume_chunks(
+                resume_text,
+                requirement_query(skill),
+                top_k=2,
+            )
+            semantic_evidence.extend(
+                f"[{chunk.section}] {chunk.content}（向量相似度 {chunk.score:.2f}）"
+                for chunk in vector_chunks
+            )
         if keyword_evidence:
             status = "supported"
             confidence = 0.92
         elif semantic_evidence:
             status = "partial"
-            confidence = 0.65
+            confidence = min(0.84, 0.5 + vector_chunks[0].score * 0.5)
         else:
             status = "missing_evidence"
             confidence = 0.2
@@ -241,10 +238,17 @@ def _run_multi_agent_analysis(
     resume_text: str, jd_text: str, target_role: str
 ) -> JobMatchAnalysis | None:
     """运行 JD、简历、评分、报告四个 Agent 的顺序协作。"""
+    baseline = _build_rule_based_analysis(resume_text, jd_text)
+    evidence_context = "\n".join(
+        f"- {item.requirement}：关键词证据={item.keyword_evidence or '无'}；"
+        f"向量召回证据={item.semantic_evidence or '无'}；状态={item.status}"
+        for item in baseline.requirement_matches
+    )
     _, raw_result = run_jobmatch_crew(
         resume_text=resume_text,
         jd_text=jd_text,
         target_role=target_role,
+        evidence_context=evidence_context,
     )
     parsed = extract_json_block(raw_result)
     if not parsed:
