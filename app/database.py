@@ -377,6 +377,23 @@ def init_db() -> None:
             """
         )
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS evidence_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                turn_id INTEGER NOT NULL,
+                analysis_run_id INTEGER NOT NULL,
+                requirement_id TEXT NOT NULL,
+                verdict TEXT NOT NULL,
+                corrected_status TEXT,
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                note TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (turn_id) REFERENCES analysis_turns(id),
+                FOREIGN KEY (analysis_run_id) REFERENCES analysis_runs(id)
+            )
+            """
+        )
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_copilot_messages_session ON copilot_messages(session_id, id)"
         )
         conn.execute(
@@ -390,6 +407,9 @@ def init_db() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_agent_stage_runs_run ON agent_stage_runs(analysis_run_id, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_evidence_feedback_run ON evidence_feedback(analysis_run_id, requirement_id, id)"
         )
 
 
@@ -590,12 +610,30 @@ def get_analysis_evidence_chain(turn_id: int) -> dict | None:
             """,
             (run["id"],),
         ).fetchall()
+        feedback_rows = conn.execute(
+            """
+            SELECT id, turn_id, analysis_run_id, requirement_id, verdict,
+                   corrected_status, evidence_ids_json, note, created_at
+            FROM evidence_feedback
+            WHERE analysis_run_id = ? AND turn_id = ?
+            ORDER BY id
+            """,
+            (run["id"], turn_id),
+        ).fetchall()
 
     def parse_json(value: str | None, fallback: object) -> object:
         try:
             return json.loads(value or "")
         except json.JSONDecodeError:
             return fallback
+
+    latest_feedback: dict[str, dict] = {}
+    for feedback in feedback_rows:
+        latest_feedback[feedback["requirement_id"]] = _evidence_feedback_row_to_dict(feedback)
+
+    def requirement_id(row: sqlite3.Row) -> str | None:
+        value = parse_json(row["requirement_json"], {})
+        return value.get("id") if isinstance(value, dict) else None
 
     return {
         "analysis_run_id": run["id"],
@@ -610,10 +648,159 @@ def get_analysis_evidence_chain(turn_id: int) -> dict | None:
                 "requirement": parse_json(row["requirement_json"], {}),
                 "candidates": parse_json(row["candidates_json"], []),
                 "decision": parse_json(row["decision_json"], None),
+                "review": latest_feedback.get(requirement_id(row)),
             }
             for row in rows
         ],
     }
+
+
+def _evidence_feedback_row_to_dict(row: sqlite3.Row | dict) -> dict:
+    evidence_ids_json = row["evidence_ids_json"]
+    try:
+        evidence_ids = json.loads(evidence_ids_json or "[]")
+    except json.JSONDecodeError:
+        evidence_ids = []
+    if not isinstance(evidence_ids, list):
+        evidence_ids = []
+    return {
+        "id": int(row["id"]),
+        "turn_id": int(row["turn_id"]),
+        "analysis_run_id": int(row["analysis_run_id"]),
+        "requirement_id": row["requirement_id"],
+        "verdict": row["verdict"],
+        "corrected_status": row["corrected_status"] or None,
+        "evidence_ids": evidence_ids,
+        "note": row["note"] or "",
+        "created_at": row["created_at"],
+    }
+
+
+def _get_evidence_run_context(
+    conn: sqlite3.Connection, run_id: int, turn_id: int
+) -> sqlite3.Row:
+    run = conn.execute(
+        "SELECT id, turn_id FROM analysis_runs WHERE id = ? AND turn_id = ?",
+        (run_id, turn_id),
+    ).fetchone()
+    if run is None:
+        raise ValueError("analysis_run 与 turn 不匹配")
+    return run
+
+
+def create_evidence_feedback(
+    *,
+    turn_id: int,
+    analysis_run_id: int,
+    requirement_id: str,
+    verdict: str,
+    corrected_status: str | None,
+    evidence_ids: list[str],
+    note: str,
+) -> dict:
+    """Persist review feedback only against the exact run and requirement."""
+    if len(set(evidence_ids)) != len(evidence_ids):
+        raise ValueError("evidence_ids 不可重复")
+    if verdict == "corrected" and corrected_status is None:
+        raise ValueError("corrected 必须指定 corrected_status")
+    if verdict != "corrected" and corrected_status is not None:
+        raise ValueError("confirmed/rejected 不应指定 corrected_status")
+    if corrected_status == "missing_evidence" and evidence_ids:
+        raise ValueError("missing_evidence 不允许关联 evidence_ids")
+    if corrected_status in {"supported", "partial"} and not evidence_ids:
+        raise ValueError("supported/partial 修正必须关联至少一条 evidence_id")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        _get_evidence_run_context(conn, analysis_run_id, turn_id)
+        evidence_row = conn.execute(
+            """
+            SELECT requirement_json, candidates_json
+            FROM requirement_evidence
+            WHERE analysis_run_id = ?
+            ORDER BY id
+            """,
+            (analysis_run_id,),
+        ).fetchall()
+        requirement_row = None
+        for row in evidence_row:
+            try:
+                requirement = json.loads(row["requirement_json"] or "{}")
+            except json.JSONDecodeError:
+                requirement = {}
+            if requirement.get("id") == requirement_id:
+                requirement_row = row
+                break
+        if requirement_row is None:
+            raise ValueError("requirement 不存在")
+        try:
+            candidate_items = json.loads(requirement_row["candidates_json"] or "[]")
+        except json.JSONDecodeError:
+            candidate_items = []
+        candidate_map = {
+            item.get("id"): item for item in candidate_items if isinstance(item, dict)
+        }
+        if any(
+            evidence_id not in candidate_map
+            or candidate_map[evidence_id].get("requirement_id") != requirement_id
+            for evidence_id in evidence_ids
+        ):
+            raise ValueError("evidence_id 不属于该 requirement")
+        cursor = conn.execute(
+            """
+            INSERT INTO evidence_feedback (
+                turn_id, analysis_run_id, requirement_id, verdict,
+                corrected_status, evidence_ids_json, note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                turn_id,
+                analysis_run_id,
+                requirement_id,
+                verdict,
+                corrected_status,
+                json.dumps(evidence_ids, ensure_ascii=False),
+                note,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM evidence_feedback WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+        conn.commit()
+        return _evidence_feedback_row_to_dict(row)
+
+
+def get_latest_evidence_feedback_by_run(
+    analysis_run_id: int, turn_id: int | None = None
+) -> dict[str, dict]:
+    """Return the newest review per requirement after validating run ownership."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        run = conn.execute(
+            "SELECT turn_id FROM analysis_runs WHERE id = ?", (analysis_run_id,)
+        ).fetchone()
+        if run is None or (turn_id is not None and int(run["turn_id"]) != turn_id):
+            return {}
+        rows = conn.execute(
+            "SELECT * FROM evidence_feedback WHERE analysis_run_id = ? AND turn_id = ? ORDER BY id",
+            (analysis_run_id, int(run["turn_id"])),
+        ).fetchall()
+        latest: dict[str, dict] = {}
+        for row in rows:
+            latest[row["requirement_id"]] = _evidence_feedback_row_to_dict(row)
+        return latest
+
+
+def get_turn_evidence_feedback_summary(turn_id: int) -> dict[str, dict]:
+    """Return reviews for the latest analysis run belonging to this turn."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        run = conn.execute(
+            "SELECT id FROM analysis_runs WHERE turn_id = ? ORDER BY id DESC LIMIT 1",
+            (turn_id,),
+        ).fetchone()
+    if run is None:
+        return {}
+    return get_latest_evidence_feedback_by_run(int(run["id"]), turn_id)
 
 
 def save_report(

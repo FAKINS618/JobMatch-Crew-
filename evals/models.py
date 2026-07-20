@@ -55,3 +55,13 @@ class EvaluationReport(BaseModel):
     case_count: int = Field(ge=0)
     metrics: EvaluationMetrics
     cases: list[CaseEvaluation] = Field(default_factory=list)
+
+
+class ReviewedFeedbackCandidate(BaseModel):
+    case_id: str = Field(min_length=1)
+    requirement_skill: str = Field(min_length=1)
+    expected_status: Literal["supported", "partial", "missing_evidence"] | None = None
+    expected_chunk_keywords: list[str] = Field(default_factory=list, max_length=8)
+    feedback_verdict: Literal["rejected", "corrected"]
+    feedback_at: str
+    needs_manual_label: bool = False
