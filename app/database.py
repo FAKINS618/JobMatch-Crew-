@@ -1,5 +1,6 @@
 import sqlite3
 import json
+import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -394,6 +395,39 @@ def init_db() -> None:
             """
         )
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS resume_market_search_preferences (
+                resume_version_id INTEGER PRIMARY KEY,
+                auto_search_enabled INTEGER NOT NULL DEFAULT 0,
+                city TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (resume_version_id) REFERENCES resume_versions(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS resume_market_search_triggers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                resume_version_id INTEGER NOT NULL,
+                source_turn_id INTEGER NOT NULL UNIQUE,
+                analysis_task_id INTEGER NOT NULL,
+                report_id INTEGER,
+                target_role TEXT NOT NULL,
+                city TEXT NOT NULL DEFAULT '',
+                trigger_mode TEXT NOT NULL DEFAULT 'auto',
+                status TEXT NOT NULL DEFAULT 'pending',
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (resume_version_id) REFERENCES resume_versions(id),
+                FOREIGN KEY (source_turn_id) REFERENCES analysis_turns(id),
+                FOREIGN KEY (analysis_task_id) REFERENCES analysis_tasks(id),
+                FOREIGN KEY (report_id) REFERENCES reports(id)
+            )
+            """
+        )
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_copilot_messages_session ON copilot_messages(session_id, id)"
         )
         conn.execute(
@@ -410,6 +444,9 @@ def init_db() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_evidence_feedback_run ON evidence_feedback(analysis_run_id, requirement_id, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_market_triggers_resume ON resume_market_search_triggers(resume_version_id, created_at)"
         )
 
 
@@ -1163,6 +1200,295 @@ def list_resume_versions() -> list[dict]:
     return [_resume_version_row_to_dict(row) for row in rows]
 
 
+def get_resume_market_search_preference(resume_version_id: int) -> dict | None:
+    """读取单个简历版本的岗位自动搜索偏好，默认关闭。"""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        if conn.execute("SELECT 1 FROM resume_versions WHERE id = ?", (resume_version_id,)).fetchone() is None:
+            return None
+        row = conn.execute(
+            "SELECT resume_version_id, auto_search_enabled, city, updated_at "
+            "FROM resume_market_search_preferences WHERE resume_version_id = ?",
+            (resume_version_id,),
+        ).fetchone()
+        if row is None:
+            return {
+                "resume_version_id": resume_version_id,
+                "auto_search_enabled": False,
+                "city": "",
+                "updated_at": None,
+            }
+        result = _with_display_times(dict(row))
+        result["auto_search_enabled"] = bool(result["auto_search_enabled"])
+        return result
+
+
+def update_resume_market_search_preference(
+    resume_version_id: int, *, auto_search_enabled: bool, city: str
+) -> dict:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        _ensure_resume_version_exists(conn, resume_version_id)
+        conn.execute(
+            """
+            INSERT INTO resume_market_search_preferences
+                (resume_version_id, auto_search_enabled, city)
+            VALUES (?, ?, ?)
+            ON CONFLICT(resume_version_id) DO UPDATE SET
+                auto_search_enabled = excluded.auto_search_enabled,
+                city = excluded.city,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (resume_version_id, int(auto_search_enabled), city.strip()),
+        )
+        row = conn.execute(
+            "SELECT resume_version_id, auto_search_enabled, city, updated_at "
+            "FROM resume_market_search_preferences WHERE resume_version_id = ?",
+            (resume_version_id,),
+        ).fetchone()
+        conn.commit()
+        result = _with_display_times(dict(row))
+        result["auto_search_enabled"] = bool(result["auto_search_enabled"])
+        return result
+
+
+def _market_trigger_row_to_dict(row: sqlite3.Row) -> dict:
+    return _with_display_times(dict(row))
+
+
+def get_resume_market_search_triggers(resume_version_id: int) -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM resume_market_search_triggers "
+            "WHERE resume_version_id = ? ORDER BY created_at DESC, id DESC",
+            (resume_version_id,),
+        ).fetchall()
+        return [_market_trigger_row_to_dict(row) for row in rows]
+
+
+def get_resume_market_search_trigger_by_turn(turn_id: int) -> dict | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM resume_market_search_triggers WHERE source_turn_id = ?",
+            (turn_id,),
+        ).fetchone()
+        return _market_trigger_row_to_dict(row) if row else None
+
+
+def create_resume_market_search_trigger(
+    *,
+    resume_version_id: int,
+    source_turn_id: int,
+    analysis_task_id: int,
+    report_id: int | None,
+    target_role: str,
+    city: str,
+    trigger_mode: str = "auto",
+) -> dict:
+    """创建可审计的自动搜索触发记录，并校验回合与简历版本归属。"""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        _ensure_resume_version_exists(conn, resume_version_id)
+        context = conn.execute(
+            """
+            SELECT s.resume_version_id
+            FROM analysis_turns t
+            JOIN copilot_sessions s ON s.id = t.session_id
+            WHERE t.id = ?
+            """,
+            (source_turn_id,),
+        ).fetchone()
+        if context is None:
+            raise ValueError("source_turn_id 不存在")
+        if context["resume_version_id"] != resume_version_id:
+            raise ValueError("source_turn_id 与简历版本不匹配")
+        existing = conn.execute(
+            "SELECT * FROM resume_market_search_triggers WHERE source_turn_id = ?",
+            (source_turn_id,),
+        ).fetchone()
+        if existing is not None:
+            return _market_trigger_row_to_dict(existing)
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO resume_market_search_triggers (
+                    resume_version_id, source_turn_id, analysis_task_id, report_id,
+                    target_role, city, trigger_mode, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+                """,
+                (resume_version_id, source_turn_id, analysis_task_id, report_id,
+                 target_role.strip(), city.strip(), trigger_mode),
+            )
+        except sqlite3.IntegrityError:
+            existing = conn.execute(
+                "SELECT * FROM resume_market_search_triggers WHERE source_turn_id = ?",
+                (source_turn_id,),
+            ).fetchone()
+            if existing is not None:
+                conn.rollback()
+                return _market_trigger_row_to_dict(existing)
+            raise
+        row = conn.execute(
+            "SELECT * FROM resume_market_search_triggers WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+        conn.commit()
+        return _market_trigger_row_to_dict(row)
+
+
+def update_resume_market_search_trigger(
+    trigger_id: int, *, status: str, report_id: int | None = None, reason: str = ""
+) -> dict | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """
+            UPDATE resume_market_search_triggers
+            SET status = ?, report_id = COALESCE(?, report_id), reason = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (status, report_id, reason[:500], trigger_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM resume_market_search_triggers WHERE id = ?", (trigger_id,)
+        ).fetchone()
+        conn.commit()
+        return _market_trigger_row_to_dict(row) if row else None
+
+
+def get_turn_auto_market_search_context(turn_id: int) -> dict | None:
+    """读取自动搜索资格所需的受控上下文，不返回原始文本。"""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT t.id AS turn_id, t.status AS turn_status, t.report_id,
+                   s.id AS session_id, s.resume_version_id, s.target_role AS session_target_role,
+                   r.target_role AS resume_target_role, r.raw_text, r.id AS resume_id
+            FROM analysis_turns t
+            JOIN copilot_sessions s ON s.id = t.session_id
+            LEFT JOIN resume_versions r ON r.id = s.resume_version_id
+            WHERE t.id = ?
+            """,
+            (turn_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        artifact = conn.execute(
+            """
+            SELECT payload_json FROM analysis_artifacts
+            WHERE turn_id = ? AND artifact_type = 'fit_strategy'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (turn_id,),
+        ).fetchone()
+        strategy = json.loads(artifact["payload_json"]) if artifact else {}
+        return {
+            "turn_id": row["turn_id"],
+            "turn_status": row["turn_status"],
+            "report_id": row["report_id"],
+            "session_id": row["session_id"],
+            "resume_version_id": row["resume_version_id"],
+            "resume_id": row["resume_id"],
+            "target_role": (row["session_target_role"] or row["resume_target_role"] or "").strip(),
+            "resume_text": row["raw_text"] or "",
+            "fit_strategy": strategy,
+        }
+
+
+def get_resume_analysis_history(resume_version_id: int) -> dict | None:
+    """聚合单个简历版本的副驾历史和市场触发记录，过滤敏感原文字段。"""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        version = conn.execute(
+            "SELECT id, resume_id, version_name, target_role, created_at FROM resume_versions WHERE id = ?",
+            (resume_version_id,),
+        ).fetchone()
+        if version is None:
+            return None
+        sessions = conn.execute(
+            "SELECT * FROM copilot_sessions WHERE resume_version_id = ? ORDER BY created_at DESC, id DESC",
+            (resume_version_id,),
+        ).fetchall()
+        session_payloads = []
+        for session in sessions:
+            messages = conn.execute(
+                "SELECT id, session_id, turn_id, role, content, created_at FROM copilot_messages WHERE session_id = ? ORDER BY id",
+                (session["id"],),
+            ).fetchall()
+            turns = conn.execute(
+                "SELECT id, session_id, status, stage, progress, report_id, input_type, created_at, updated_at FROM analysis_turns WHERE session_id = ? ORDER BY id DESC",
+                (session["id"],),
+            ).fetchall()
+            turn_payloads = []
+            for turn in turns:
+                artifacts = conn.execute(
+                    "SELECT id, turn_id, artifact_type, payload_json, status, created_at FROM analysis_artifacts WHERE turn_id = ? AND artifact_type IN ('job_brief', 'evidence_map', 'fit_strategy', 'action_bundle') ORDER BY id",
+                    (turn["id"],),
+                ).fetchall()
+                turn_payloads.append({
+                    **_with_display_times(dict(turn)),
+                    "artifacts": [
+                        {
+                            **_with_display_times({k: item[k] for k in item.keys() if k != "payload_json"}),
+                            "payload": _scrub_history_value(json.loads(item["payload_json"])),
+                        }
+                        for item in artifacts
+                    ],
+                })
+            session_payloads.append({
+                **_with_display_times({k: session[k] for k in session.keys() if k != "active_report_id"}),
+                "messages": [
+                    {
+                        **_with_display_times(dict(message)),
+                        "content": _scrub_history_text(message["content"]),
+                    }
+                    for message in messages
+                ],
+                "turns": turn_payloads,
+            })
+        reports = conn.execute(
+            """
+            SELECT id, target_role, score, parse_status, parsed_result, created_at,
+                   (SELECT COUNT(*) FROM job_posts p WHERE p.report_id = reports.id) AS job_post_count
+            FROM reports WHERE resume_version_id = ? ORDER BY created_at DESC, id DESC
+            """,
+            (resume_version_id,),
+        ).fetchall()
+        report_payloads = []
+        for report in reports:
+            try:
+                parsed = json.loads(report["parsed_result"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                parsed = {}
+            summary = str(parsed.get("summary") or "")[:500]
+            report_payloads.append({
+                **_with_display_times({
+                    "id": report["id"],
+                    "target_role": report["target_role"],
+                    "score": report["score"],
+                    "parse_status": report["parse_status"] or "",
+                    "created_at": report["created_at"],
+                    "job_post_count": report["job_post_count"],
+                }),
+                "report_summary": summary,
+            })
+        result = {
+            "resume_version_id": version["id"],
+            "resume_id": version["resume_id"],
+            "version_name": version["version_name"],
+            "target_role": version["target_role"] or "",
+            "created_at": version["created_at"],
+            "sessions": session_payloads,
+            "reports": report_payloads,
+            "market_search_preference": get_resume_market_search_preference(resume_version_id),
+            "market_search_triggers": get_resume_market_search_triggers(resume_version_id),
+        }
+        return _with_display_times(result)
+
+
 def _resume_version_row_to_dict(row: sqlite3.Row) -> dict:
     """将 SQLite 行恢复成 API 可直接返回的简历版本对象。"""
     return {
@@ -1189,6 +1515,39 @@ def _job_target_row_to_dict(row: sqlite3.Row) -> dict:
     result = _with_display_times(dict(row))
     result["applied_at"] = format_datetime_for_display(result["applied_at"])
     return result
+
+
+_HISTORY_FORBIDDEN_KEYS = {
+    "raw_result",
+    "raw_output",
+    "resume_text",
+    "jd_text",
+    "api_key",
+    "embedding_api_key",
+    "base_url",
+}
+
+
+def _scrub_history_value(value):
+    """Remove debug/raw fields before structured history leaves the backend."""
+    if isinstance(value, dict):
+        return {
+            key: _scrub_history_value(item)
+            for key, item in value.items()
+            if str(key).lower() not in _HISTORY_FORBIDDEN_KEYS
+        }
+    if isinstance(value, list):
+        return [_scrub_history_value(item) for item in value]
+    return value
+
+
+def _scrub_history_text(value: str) -> str:
+    """Redact obvious API-key forms in user-visible conversation history."""
+    return re.sub(
+        r"(?i)(api[_-]?key\s*[:=]\s*|sk-[a-z0-9_-]{16,})[^\s,;]+",
+        "[REDACTED]",
+        value,
+    )
 
 
 def create_job_target(payload: JobTargetCreate) -> dict:
