@@ -7,6 +7,11 @@ export class ApiError extends Error {
   }
 }
 
+export function resolveApiUrl(path: string): string {
+  const baseUrl = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
+  return baseUrl ? `${baseUrl}${path}` : path;
+}
+
 function readErrorDetail(payload: unknown): string {
   if (typeof payload === "object" && payload !== null && "detail" in payload) {
     const detail = payload.detail;
@@ -22,7 +27,7 @@ function readErrorDetail(payload: unknown): string {
 }
 
 export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(resolveApiUrl(path), {
     ...init,
     headers: { "Content-Type": "application/json", ...init.headers },
   });

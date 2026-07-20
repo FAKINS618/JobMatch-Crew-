@@ -1,10 +1,22 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { apiFetch } from "./client";
+import { apiFetch, resolveApiUrl } from "./client";
 import { submitEvidenceFeedback } from "./copilot";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
+});
 
 describe("apiFetch", () => {
+  it("keeps relative URLs when no API base is configured", () => {
+    expect(resolveApiUrl("/api/test")).toBe("/api/test");
+  });
+
+  it("prefixes URLs with the configured API base", () => {
+    vi.stubEnv("VITE_API_BASE_URL", "http://127.0.0.1:8000/");
+    expect(resolveApiUrl("/api/test")).toBe("http://127.0.0.1:8000/api/test");
+  });
+
   it("returns typed JSON for a successful response", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response('{"id": 1}', { status: 200 })));
 

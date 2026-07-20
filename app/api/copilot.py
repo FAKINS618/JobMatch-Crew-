@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -30,6 +31,7 @@ from app.schemas.agent_pipeline import (
     EvidenceFeedback,
     EvidenceFeedbackRequest,
 )
+from app.config import settings
 from app.services.copilot_service import run_copilot_turn
 
 
@@ -143,7 +145,8 @@ def submit_evidence_feedback(
 async def stream_turn_events(turn_id: int) -> StreamingResponse:
     async def event_stream() -> AsyncIterator[str]:
         previous_payload = ""
-        for _ in range(60):
+        started_at = time.monotonic()
+        while time.monotonic() - started_at < max(1, settings.sse_max_seconds):
             turn = get_copilot_turn(turn_id)
             if turn is None:
                 yield "event: error\ndata: {\"message\": \"分析回合不存在\"}\n\n"
@@ -154,7 +157,9 @@ async def stream_turn_events(turn_id: int) -> StreamingResponse:
                 previous_payload = payload
             if turn["status"] in {"completed", "failed"}:
                 return
-            await asyncio.sleep(0.5)
+            yield ": keepalive\n\n"
+            await asyncio.sleep(max(0.1, settings.sse_poll_interval_seconds))
+        yield "event: timeout\ndata: {\"message\": \"分析仍在运行，请稍后查询分析回合。\"}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

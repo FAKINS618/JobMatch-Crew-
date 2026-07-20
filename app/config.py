@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     embedding_api_key: str | None = None
     embedding_base_url: str = ""
     embedding_timeout_seconds: int = 15
+    cors_allowed_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    sse_max_seconds: int = 600
+    sse_poll_interval_seconds: float = 0.5
 
     model_config = SettingsConfigDict(
         env_file=".env",
