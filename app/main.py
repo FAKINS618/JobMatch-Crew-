@@ -2,6 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.health import router as health_router
 from app.api.job_match import router as job_match_router
@@ -15,6 +16,8 @@ from app.api.action_items import router as action_items_router
 from app.api.dashboard import router as dashboard_router
 from app.api.job_targets import router as job_targets_router
 from app.api.copilot import router as copilot_router
+from app.api.system import router as system_router
+from app.config import settings
 
 logging.basicConfig(level=logging.INFO)
 
@@ -37,6 +40,18 @@ def create_app() -> FastAPI:
         version="0.5.0",
         lifespan=lifespan,
     )
+    allowed_origins = [
+        origin.strip()
+        for origin in settings.cors_allowed_origins.split(",")
+        if origin.strip()
+    ]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+        allow_headers=["Content-Type"],
+    )
 
     app.include_router(health_router)
     app.include_router(job_match_router)
@@ -49,6 +64,7 @@ def create_app() -> FastAPI:
     app.include_router(dashboard_router)
     app.include_router(job_targets_router)
     app.include_router(copilot_router)
+    app.include_router(system_router)
     return app
 
 
