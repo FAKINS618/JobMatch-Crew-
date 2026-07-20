@@ -11,6 +11,7 @@ from app.database import (
     create_artifact_decision,
     create_copilot_message_and_turn,
     create_copilot_session,
+    create_evidence_feedback,
     get_analysis_evidence_chain,
     get_copilot_session,
     get_copilot_turn,
@@ -24,7 +25,11 @@ from app.schemas import (
     CopilotSessionDetailResponse,
     CopilotSessionResponse,
 )
-from app.schemas.agent_pipeline import EvidenceChainResponse
+from app.schemas.agent_pipeline import (
+    EvidenceChainResponse,
+    EvidenceFeedback,
+    EvidenceFeedbackRequest,
+)
 from app.services.copilot_service import run_copilot_turn
 
 
@@ -83,6 +88,55 @@ def get_turn_evidence(turn_id: int) -> EvidenceChainResponse:
     if evidence is None:
         raise HTTPException(status_code=404, detail="证据链不存在")
     return EvidenceChainResponse.model_validate({"turn_id": turn_id, **evidence})
+
+
+@router.post(
+    "/turns/{turn_id}/evidence-feedback",
+    response_model=EvidenceFeedback,
+    status_code=201,
+)
+def submit_evidence_feedback(
+    turn_id: int, payload: EvidenceFeedbackRequest
+) -> EvidenceFeedback:
+    if get_copilot_turn(turn_id) is None:
+        raise HTTPException(status_code=404, detail="分析回合不存在")
+    evidence = get_analysis_evidence_chain(turn_id)
+    if evidence is None or not evidence.get("items"):
+        raise HTTPException(status_code=409, detail="证据链尚未生成")
+    item = next(
+        (
+            value
+            for value in evidence["items"]
+            if value.get("requirement", {}).get("id") == payload.requirement_id
+        ),
+        None,
+    )
+    if item is None:
+        raise HTTPException(status_code=422, detail="requirement 不存在")
+    candidate_map = {
+        candidate.get("id"): candidate
+        for candidate in item.get("candidates", [])
+        if isinstance(candidate, dict)
+    }
+    if any(
+        evidence_id not in candidate_map
+        or candidate_map[evidence_id].get("requirement_id") != payload.requirement_id
+        for evidence_id in payload.evidence_ids
+    ):
+        raise HTTPException(status_code=422, detail="evidence_id 不属于该 requirement")
+    try:
+        created = create_evidence_feedback(
+            turn_id=turn_id,
+            analysis_run_id=int(evidence["analysis_run_id"]),
+            requirement_id=payload.requirement_id,
+            verdict=payload.verdict,
+            corrected_status=payload.corrected_status,
+            evidence_ids=payload.evidence_ids,
+            note=payload.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return EvidenceFeedback.model_validate(created)
 
 
 @router.get("/turns/{turn_id}/events")

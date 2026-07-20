@@ -1,11 +1,61 @@
 <script setup lang="ts">
-import type { EvidenceChain } from "@/api/copilot";
+import { ref } from "vue";
+import type { EvidenceChain, EvidenceFeedbackVerdict, EvidenceStatus } from "@/api/copilot";
 
 defineProps<{
   chain: EvidenceChain | null;
   loading: boolean;
   error: string;
 }>();
+
+const emit = defineEmits<{
+  review: [payload: {
+    turnId: number;
+    requirementId: string;
+    verdict: EvidenceFeedbackVerdict;
+    correctedStatus: EvidenceStatus | null;
+    evidenceIds: string[];
+    note: string;
+  }];
+}>();
+
+const correctionRequirementId = ref<string | null>(null);
+const correctionStatus = ref<EvidenceStatus>("partial");
+const selectedEvidenceIds = ref<string[]>([]);
+const reviewNote = ref("");
+
+function quickReview(chain: EvidenceChain, requirementId: string, verdict: EvidenceFeedbackVerdict) {
+  emit("review", {
+    turnId: chain.turn_id,
+    requirementId,
+    verdict,
+    correctedStatus: null,
+    evidenceIds: [],
+    note: "",
+  });
+}
+
+function openCorrection(item: EvidenceChain["items"][number]) {
+  correctionRequirementId.value = item.requirement.id;
+  correctionStatus.value = item.decision?.status ?? "partial";
+  selectedEvidenceIds.value = item.decision?.evidence_ids.filter((id) =>
+    item.candidates.some((candidate) => candidate.id === id),
+  ) ?? [];
+  reviewNote.value = "";
+}
+
+function submitCorrection(chain: EvidenceChain) {
+  if (!correctionRequirementId.value) return;
+  emit("review", {
+    turnId: chain.turn_id,
+    requirementId: correctionRequirementId.value,
+    verdict: "corrected",
+    correctedStatus: correctionStatus.value,
+    evidenceIds: correctionStatus.value === "missing_evidence" ? [] : selectedEvidenceIds.value,
+    note: reviewNote.value.trim(),
+  });
+  correctionRequirementId.value = null;
+}
 
 function statusLabel(value: string): string {
   if (value === "supported") return "已有直接证据";
@@ -15,6 +65,12 @@ function statusLabel(value: string): string {
 
 function scoreLabel(value: number | null): string {
   return value === null ? "未计算" : value.toFixed(2);
+}
+
+function reviewLabel(verdict: EvidenceFeedbackVerdict, correctedStatus: EvidenceStatus | null): string {
+  if (verdict === "confirmed") return "已确认系统判断";
+  if (verdict === "rejected") return "已标记为错误";
+  return `已修正为 ${statusLabel(correctedStatus ?? "partial")}`;
 }
 </script>
 
@@ -40,6 +96,11 @@ function scoreLabel(value: number | null): string {
             {{ statusLabel(item.decision.status) }} · {{ Math.round(item.decision.confidence * 100) }}%
           </span>
         </div>
+        <div class="evidence-review-actions">
+          <button type="button" @click="quickReview(chain, item.requirement.id, 'confirmed')">确认判断</button>
+          <button type="button" @click="quickReview(chain, item.requirement.id, 'rejected')">判断有误</button>
+          <button type="button" @click="openCorrection(item)">修正</button>
+        </div>
         <div v-if="item.candidates.length" class="evidence-candidate-list">
           <div v-for="candidate in item.candidates" :key="candidate.id" class="evidence-candidate">
             <p>{{ candidate.snippet }}</p>
@@ -48,8 +109,29 @@ function scoreLabel(value: number | null): string {
         </div>
         <p v-else class="helper-text">没有召回到候选简历片段。</p>
         <p v-if="item.decision" class="evidence-rationale">裁决理由：{{ item.decision.rationale }}</p>
+        <div v-if="correctionRequirementId === item.requirement.id" class="evidence-correction-form">
+          <label>
+            修正状态
+            <select v-model="correctionStatus">
+              <option value="supported">已有直接证据</option>
+              <option value="partial">证据待补强</option>
+              <option value="missing_evidence">缺少简历证据</option>
+            </select>
+          </label>
+          <fieldset v-if="correctionStatus !== 'missing_evidence'">
+            <legend>关联证据</legend>
+            <label v-for="candidate in item.candidates" :key="candidate.id">
+              <input v-model="selectedEvidenceIds" type="checkbox" :value="candidate.id" />
+              {{ candidate.id }}
+            </label>
+          </fieldset>
+          <textarea v-model="reviewNote" maxlength="300" placeholder="补充复核说明（可选）" />
+          <button type="button" @click="submitCorrection(chain)">保存修正</button>
+        </div>
+        <div v-if="item.review" class="evidence-review-result">
+          {{ reviewLabel(item.review.verdict, item.review.corrected_status) }}<span v-if="item.review.note">：{{ item.review.note }}</span>
+        </div>
       </article>
     </div>
   </section>
 </template>
-

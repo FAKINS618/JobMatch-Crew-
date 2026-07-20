@@ -95,6 +95,8 @@ export interface EvidenceChain {
       chunk_id: string;
       snippet: string;
       lexical_score: number;
+      embedding_score?: number | null;
+      fusion_score?: number | null;
       rerank_score: number | null;
     }>;
     decision: {
@@ -104,7 +106,23 @@ export interface EvidenceChain {
       confidence: number;
       rationale: string;
     } | null;
+    review: EvidenceFeedback | null;
   }>;
+}
+
+export type EvidenceFeedbackVerdict = "confirmed" | "rejected" | "corrected";
+export type EvidenceStatus = "supported" | "partial" | "missing_evidence";
+
+export interface EvidenceFeedback {
+  id: number;
+  turn_id: number;
+  analysis_run_id: number;
+  requirement_id: string;
+  verdict: EvidenceFeedbackVerdict;
+  corrected_status: EvidenceStatus | null;
+  evidence_ids: string[];
+  note: string;
+  created_at: string;
 }
 
 export function listResumeVersions(): Promise<ResumeVersion[]> {
@@ -135,6 +153,28 @@ export function getTurn(turnId: number) {
 
 export function getTurnEvidence(turnId: number) {
   return apiFetch<EvidenceChain>(`/api/v1/copilot/turns/${turnId}/evidence`);
+}
+
+export function submitEvidenceFeedback(
+  turnId: number,
+  payload: {
+    requirement_id: string;
+    verdict: EvidenceFeedbackVerdict;
+    corrected_status?: EvidenceStatus | null;
+    evidence_ids?: string[];
+    note?: string;
+  },
+) {
+  return apiFetch<EvidenceFeedback>(`/api/v1/copilot/turns/${turnId}/evidence-feedback`, {
+    method: "POST",
+    body: JSON.stringify({
+      requirement_id: payload.requirement_id,
+      verdict: payload.verdict,
+      corrected_status: payload.corrected_status ?? null,
+      evidence_ids: payload.evidence_ids ?? [],
+      note: payload.note ?? "",
+    }),
+  });
 }
 
 export function decideArtifact(

@@ -8,9 +8,12 @@ import {
   getTurnEvidence,
   listResumeVersions,
   sendMessage,
+  submitEvidenceFeedback,
   type AnalysisTurn,
   type CopilotSession,
   type EvidenceChain,
+  type EvidenceFeedbackVerdict,
+  type EvidenceStatus,
   type ResumeVersion,
 } from "@/api/copilot";
 
@@ -96,6 +99,24 @@ export const useCopilotStore = defineStore("copilot", () => {
     }
   }
 
+  async function reviewEvidence(
+    turnId: number,
+    requirementId: string,
+    verdict: EvidenceFeedbackVerdict,
+    correctedStatus: EvidenceStatus | null = null,
+    evidenceIds: string[] = [],
+    note = "",
+  ) {
+    await submitEvidenceFeedback(turnId, {
+      requirement_id: requirementId,
+      verdict,
+      corrected_status: correctedStatus,
+      evidence_ids: evidenceIds,
+      note,
+    });
+    await loadEvidence(turnId);
+  }
+
   async function decide(artifactId: number, decision: "accept" | "reject" | "ask" | "create_task") {
     await decideArtifact(artifactId, decision);
   }
@@ -113,6 +134,8 @@ export const useCopilotStore = defineStore("copilot", () => {
     evidenceLoading,
     evidenceError,
     loadResumeVersions,
+    loadEvidence,
+    reviewEvidence,
     startSession,
     submit,
     decide,

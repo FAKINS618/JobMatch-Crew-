@@ -4,6 +4,7 @@ import { useRoute } from "vue-router";
 import ArtifactCards from "@/components/ArtifactCards.vue";
 import EvidenceChain from "@/components/EvidenceChain.vue";
 import { createActionItemsFromReport } from "@/api/workspace";
+import type { EvidenceFeedbackVerdict, EvidenceStatus } from "@/api/copilot";
 import { useCopilotStore } from "@/stores/copilot";
 
 const store = useCopilotStore();
@@ -83,6 +84,31 @@ async function decide(artifactId: number, decision: "accept" | "reject" | "ask" 
     store.isLoading = false;
   }
 }
+
+async function reviewEvidence(payload: {
+  turnId: number;
+  requirementId: string;
+  verdict: EvidenceFeedbackVerdict;
+  correctedStatus: EvidenceStatus | null;
+  evidenceIds: string[];
+  note: string;
+}) {
+  store.errorMessage = "";
+  store.noticeMessage = "";
+  try {
+    await store.reviewEvidence(
+      payload.turnId,
+      payload.requirementId,
+      payload.verdict,
+      payload.correctedStatus,
+      payload.evidenceIds,
+      payload.note,
+    );
+    store.noticeMessage = "证据复核已保存。";
+  } catch (error) {
+    store.errorMessage = error instanceof Error ? error.message : "证据复核保存失败";
+  }
+}
 </script>
 
 <template>
@@ -149,6 +175,7 @@ async function decide(artifactId: number, decision: "accept" | "reject" | "ask" 
         :chain="store.evidenceChain"
         :loading="store.evidenceLoading"
         :error="store.evidenceError"
+        @review="reviewEvidence"
       />
     </template>
   </div>
