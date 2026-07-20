@@ -61,6 +61,107 @@ export interface ReportDetail extends ReportSummary {
   job_posts: JobPost[];
 }
 
+export interface ResumeMarketSearchPreference {
+  resume_version_id: number;
+  auto_search_enabled: boolean;
+  city: string;
+  updated_at: string | null;
+}
+
+export interface ResumeHistoryArtifact {
+  id: number;
+  turn_id: number;
+  artifact_type: "job_brief" | "evidence_map" | "fit_strategy" | "action_bundle";
+  payload: Record<string, unknown>;
+  status: string;
+  created_at: string | null;
+}
+
+export interface ResumeHistoryMessage {
+  id: number;
+  session_id: number;
+  turn_id: number | null;
+  role: "user" | "assistant";
+  content: string;
+  created_at: string | null;
+}
+
+export interface ResumeHistoryTurn {
+  id: number;
+  session_id: number;
+  status: string;
+  stage: string;
+  progress: number;
+  report_id: number | null;
+  input_type: "initial_jd" | "follow_up";
+  created_at: string | null;
+  updated_at: string | null;
+  artifacts: ResumeHistoryArtifact[];
+}
+
+export interface ResumeAnalysisHistory {
+  resume_version_id: number;
+  resume_id: number;
+  version_name: string;
+  target_role: string;
+  created_at: string | null;
+  sessions: Array<{
+    id: number;
+    resume_version_id: number | null;
+    target_role: string;
+    status: string;
+    created_at: string | null;
+    updated_at: string | null;
+    messages: ResumeHistoryMessage[];
+    turns: ResumeHistoryTurn[];
+  }>;
+  reports: Array<{
+    id: number;
+    target_role: string;
+    score: number | null;
+    parse_status: string;
+    report_summary: string;
+    created_at: string | null;
+    created_at_local: string | null;
+    job_post_count: number;
+  }>;
+  market_search_preference: ResumeMarketSearchPreference;
+  market_search_triggers: Array<{
+    id: number;
+    resume_version_id: number;
+    source_turn_id: number;
+    analysis_task_id: number;
+    report_id: number | null;
+    target_role: string;
+    city: string;
+    trigger_mode: "auto" | "manual";
+    status: "pending" | "running" | "success" | "failed" | "skipped";
+    reason: string;
+    created_at: string | null;
+    updated_at: string | null;
+  }>;
+}
+
+export function getResumeAnalysisHistory(resumeVersionId: number) {
+  return apiFetch<ResumeAnalysisHistory>(`/api/resumes/versions/${resumeVersionId}/history`);
+}
+
+export function getMarketSearchPreference(resumeVersionId: number) {
+  return apiFetch<ResumeMarketSearchPreference>(
+    `/api/resumes/versions/${resumeVersionId}/market-search-preference`,
+  );
+}
+
+export function updateMarketSearchPreference(
+  resumeVersionId: number,
+  payload: { auto_search_enabled: boolean; city: string },
+) {
+  return apiFetch<ResumeMarketSearchPreference>(
+    `/api/resumes/versions/${resumeVersionId}/market-search-preference`,
+    { method: "PATCH", body: JSON.stringify(payload) },
+  );
+}
+
 export function parseResume(rawText: string) {
   return apiFetch<{ profile: ResumeProfile }>("/api/resumes/parse", {
     method: "POST",

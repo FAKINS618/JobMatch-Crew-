@@ -9,6 +9,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.database import (
+    create_analysis_task,
     create_artifact_decision,
     create_copilot_message_and_turn,
     create_copilot_session,
@@ -16,6 +17,11 @@ from app.database import (
     get_analysis_evidence_chain,
     get_copilot_session,
     get_copilot_turn,
+    get_analysis_task,
+    get_resume_market_search_preference,
+    get_resume_market_search_trigger_by_turn,
+    get_turn_auto_market_search_context,
+    create_resume_market_search_trigger,
 )
 from app.schemas import (
     AnalysisTurnResponse,
@@ -25,6 +31,8 @@ from app.schemas import (
     CopilotSessionCreate,
     CopilotSessionDetailResponse,
     CopilotSessionResponse,
+    AutoMarketSearchResponse,
+    MarketMatchRequest,
 )
 from app.schemas.agent_pipeline import (
     EvidenceChainResponse,
@@ -33,6 +41,7 @@ from app.schemas.agent_pipeline import (
 )
 from app.config import settings
 from app.services.copilot_service import run_copilot_turn
+from app.services.analysis_task_service import run_auto_market_match_task
 
 
 router = APIRouter(prefix="/api/v1/copilot", tags=["Copilot"])
@@ -139,6 +148,67 @@ def submit_evidence_feedback(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return EvidenceFeedback.model_validate(created)
+
+
+@router.post(
+    "/turns/{turn_id}/market-search",
+    response_model=AutoMarketSearchResponse,
+    status_code=202,
+)
+def trigger_market_search(
+    turn_id: int, background_tasks: BackgroundTasks
+) -> AutoMarketSearchResponse:
+    """Opt-in岗位搜索：只接受已完成且建议立即投递的分析回合。"""
+    context = get_turn_auto_market_search_context(turn_id)
+    if context is None:
+        raise HTTPException(status_code=404, detail="分析回合不存在")
+
+    existing = get_resume_market_search_trigger_by_turn(turn_id)
+    if existing is not None:
+        task = get_analysis_task(int(existing["analysis_task_id"])) or {}
+        return AutoMarketSearchResponse.model_validate(
+            {"trigger": existing, "task_status": task.get("status", existing["status"]), "reused": True}
+        )
+
+    if context["turn_status"] != "completed":
+        raise HTTPException(status_code=409, detail="分析尚未完成，暂不能启动岗位搜索")
+    if (context["fit_strategy"] or {}).get("recommendation") != "apply_now":
+        raise HTTPException(status_code=409, detail="当前分析建议不是立即投递")
+    resume_version_id = context.get("resume_version_id")
+    if resume_version_id is None:
+        raise HTTPException(status_code=422, detail="当前分析未关联简历版本")
+    preference = get_resume_market_search_preference(int(resume_version_id))
+    if preference is None:
+        raise HTTPException(status_code=404, detail="简历版本不存在")
+    if not preference["auto_search_enabled"]:
+        raise HTTPException(status_code=409, detail="该简历版本未开启自动搜索")
+    target_role = str(context.get("target_role") or "").strip()
+    if not target_role:
+        raise HTTPException(status_code=422, detail="请先为简历版本设置目标岗位方向")
+
+    payload = MarketMatchRequest(
+        resume_text=context["resume_text"],
+        target_role=target_role,
+        city=preference.get("city", ""),
+        max_results=8,
+        resume_version_id=int(resume_version_id),
+    )
+    task_id = create_analysis_task(task_type="market_match")
+    try:
+        trigger = create_resume_market_search_trigger(
+            resume_version_id=int(resume_version_id),
+            source_turn_id=turn_id,
+            analysis_task_id=task_id,
+            report_id=context.get("report_id"),
+            target_role=target_role,
+            city=preference.get("city", ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    background_tasks.add_task(run_auto_market_match_task, task_id, payload, int(trigger["id"]))
+    return AutoMarketSearchResponse.model_validate(
+        {"trigger": trigger, "task_status": "pending", "reused": False}
+    )
 
 
 @router.get("/turns/{turn_id}/events")
