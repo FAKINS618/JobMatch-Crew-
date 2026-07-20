@@ -367,6 +367,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS requirement_evidence (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 analysis_run_id INTEGER NOT NULL,
+                chunks_json TEXT NOT NULL DEFAULT '[]',
                 requirement_json TEXT NOT NULL,
                 candidates_json TEXT NOT NULL,
                 decision_json TEXT,
@@ -396,6 +397,7 @@ def init_db() -> None:
         _ensure_job_post_columns(conn)
         _ensure_session_columns(conn)
         _ensure_turn_columns(conn)
+        _ensure_requirement_evidence_columns(conn)
         conn.commit()
 
 
@@ -449,6 +451,18 @@ def _ensure_turn_columns(conn: sqlite3.Connection) -> None:
             conn.execute(
                 f"ALTER TABLE analysis_turns ADD COLUMN {column_name} {column_type}"
             )
+
+
+def _ensure_requirement_evidence_columns(conn: sqlite3.Connection) -> None:
+    """Add pipeline evidence fields to databases created by the first M1 draft."""
+    existing_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(requirement_evidence)").fetchall()
+    }
+    if "chunks_json" not in existing_columns:
+        conn.execute(
+            "ALTER TABLE requirement_evidence ADD COLUMN chunks_json TEXT NOT NULL DEFAULT '[]'"
+        )
 
 
 def create_analysis_run(turn_id: int, pipeline_version: str) -> int:
@@ -515,6 +529,7 @@ def save_agent_stage_run(
 def save_requirement_evidence(
     *,
     run_id: int,
+    chunks_json: str = "[]",
     requirement_json: str,
     candidates_json: str,
     decision_json: str | None,
@@ -523,10 +538,10 @@ def save_requirement_evidence(
         cursor = conn.execute(
             """
             INSERT INTO requirement_evidence (
-                analysis_run_id, requirement_json, candidates_json, decision_json
-            ) VALUES (?, ?, ?, ?)
+                analysis_run_id, chunks_json, requirement_json, candidates_json, decision_json
+            ) VALUES (?, ?, ?, ?, ?)
             """,
-            (run_id, requirement_json, candidates_json, decision_json),
+            (run_id, chunks_json, requirement_json, candidates_json, decision_json),
         )
         conn.commit()
         return int(cursor.lastrowid)

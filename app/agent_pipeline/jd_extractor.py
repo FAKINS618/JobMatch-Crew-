@@ -4,7 +4,7 @@ import re
 
 from pydantic import BaseModel, Field
 
-from app.agent_pipeline.structured_runner import StructuredStageError, run_structured
+from app.agent_pipeline.structured_runner import StageOutcome, run_structured
 from app.schemas.agent_pipeline import JDRequirement
 from app.services.market_profile_service import SKILL_KEYWORDS
 
@@ -59,7 +59,9 @@ def rule_extract_requirements(jd_text: str) -> list[JDRequirement]:
     return requirements
 
 
-def extract_requirements(jd_text: str, target_role: str, *, use_llm: bool) -> tuple[list[JDRequirement], bool]:
+def extract_requirements(
+    jd_text: str, target_role: str, *, use_llm: bool
+) -> tuple[list[JDRequirement], bool, StageOutcome]:
     prompt = f"""
     目标岗位：{target_role}
     从以下 JD 中抽取最多 20 条技术或项目要求。
@@ -71,13 +73,20 @@ def extract_requirements(jd_text: str, target_role: str, *, use_llm: bool) -> tu
     {jd_text}
     """
     try:
-        bundle = run_structured(
+        outcome = run_structured(
             prompt=prompt,
             output_model=JDRequirementBundle,
             expected_output="包含 requirements 数组的 JSON 对象",
             enabled=use_llm,
         )
-        validate_requirement_quotes(bundle.requirements, jd_text)
-        return bundle.requirements, False
-    except (StructuredStageError, ValueError):
-        return rule_extract_requirements(jd_text), True
+        if outcome.value is None:
+            return rule_extract_requirements(jd_text), True, outcome
+        validate_requirement_quotes(outcome.value.requirements, jd_text)
+        return outcome.value.requirements, outcome.degraded, outcome
+    except ValueError as error:
+        fallback = StageOutcome(
+            value=None,
+            validation_error=f"requirement validation: {type(error).__name__}: {str(error)[:400]}",
+            degraded=True,
+        )
+        return rule_extract_requirements(jd_text), True, fallback

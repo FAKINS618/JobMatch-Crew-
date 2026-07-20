@@ -3,7 +3,9 @@
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from app.schemas.analysis import ActionPlanItem, InterviewQuestion
 
 
 class AgentStage(StrEnum):
@@ -56,9 +58,23 @@ class EvidenceDecision(BaseModel):
     def validate_evidence_status(self):
         if self.status == "supported" and not self.evidence_ids:
             raise ValueError("supported 必须关联至少一条真实 evidence_id")
+        if self.status == "partial" and not self.evidence_ids:
+            raise ValueError("partial 必须关联至少一条真实 evidence_id")
         if self.status == "missing_evidence" and self.evidence_ids:
             raise ValueError("missing_evidence 不应关联证据")
         return self
+
+
+class ReportNarrative(BaseModel):
+    """LLM may write narrative fields, but never factual match fields."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(min_length=20)
+    resume_bullets: list[str] = Field(default_factory=list)
+    interview_questions: list[InterviewQuestion] = Field(default_factory=list)
+    action_plan: list[ActionPlanItem] = Field(default_factory=list)
+    risk_points: list[str] = Field(default_factory=list)
 
 
 class ScoringResult(BaseModel):
@@ -68,4 +84,3 @@ class ScoringResult(BaseModel):
     project_relevance: float = Field(ge=0, le=1)
     review_required: bool = False
     review_reason: str = ""
-

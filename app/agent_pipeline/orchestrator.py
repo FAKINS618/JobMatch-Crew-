@@ -66,6 +66,7 @@ def run_analysis_pipeline(
         input_payload: object,
         output_payload: object,
         error: str = "",
+        retry_count: int = 0,
     ) -> None:
         save_agent_stage_run(
             run_id=run_id,
@@ -74,6 +75,7 @@ def run_analysis_pipeline(
             input_json=_json(input_payload),
             output_json=_json(output_payload),
             validation_error=error,
+            retry_count=retry_count,
             latency_ms=round((time.perf_counter() - started) * 1000),
         )
 
@@ -83,26 +85,59 @@ def run_analysis_pipeline(
         save_stage(AgentStage.QUEUED, "validated", started, {}, {})
 
         started = time.perf_counter()
-        requirements, jd_degraded = extract_requirements(jd_text, target_role, use_llm=use_llm)
+        requirements, jd_degraded, jd_outcome = extract_requirements(
+            jd_text, target_role, use_llm=use_llm
+        )
         degraded = degraded or jd_degraded
-        save_stage(AgentStage.JD_EXTRACTED, "degraded" if jd_degraded else "validated", started, {"target_role": target_role}, requirements)
+        save_stage(
+            AgentStage.JD_EXTRACTED,
+            "degraded" if jd_degraded else "validated",
+            started,
+            {"target_role": target_role},
+            requirements,
+            error=jd_outcome.validation_error,
+            retry_count=jd_outcome.retry_count,
+        )
 
         stage(AgentStage.EVIDENCE_RETRIEVED, 30)
         started = time.perf_counter()
-        candidates = retrieve_candidates(resume_text, requirements)
-        save_stage(AgentStage.EVIDENCE_RETRIEVED, "validated", started, {"requirement_count": len(requirements)}, candidates)
+        candidates, resume_chunks = retrieve_candidates(resume_text, requirements)
+        save_stage(
+            AgentStage.EVIDENCE_RETRIEVED,
+            "validated",
+            started,
+            {"requirement_count": len(requirements)},
+            {"chunks": resume_chunks, "candidates": candidates},
+        )
 
         stage(AgentStage.EVIDENCE_JUDGED, 50)
         started = time.perf_counter()
-        decisions, judge_degraded = judge_evidence(requirements, candidates, use_llm=use_llm)
+        decisions, judge_degraded, judge_outcome = judge_evidence(
+            requirements, candidates, use_llm=use_llm
+        )
         degraded = degraded or judge_degraded
-        save_stage(AgentStage.EVIDENCE_JUDGED, "degraded" if judge_degraded else "validated", started, candidates, decisions)
+        save_stage(
+            AgentStage.EVIDENCE_JUDGED,
+            "degraded" if judge_degraded else "validated",
+            started,
+            candidates,
+            decisions,
+            error=judge_outcome.validation_error,
+            retry_count=judge_outcome.retry_count,
+        )
         for requirement in requirements:
             decision = next((item for item in decisions if item.requirement_id == requirement.id), None)
+            requirement_candidates = candidates.get(requirement.id, [])
+            requirement_chunks = {
+                candidate.chunk_id: resume_chunks[candidate.chunk_id]
+                for candidate in requirement_candidates
+                if candidate.chunk_id in resume_chunks
+            }
             save_requirement_evidence(
                 run_id=run_id,
+                chunks_json=_json(requirement_chunks),
                 requirement_json=_json(requirement.model_dump()),
-                candidates_json=_json([item.model_dump() for item in candidates.get(requirement.id, [])]),
+                candidates_json=_json([item.model_dump() for item in requirement_candidates]),
                 decision_json=_json(decision.model_dump() if decision else None),
             )
 
@@ -113,11 +148,19 @@ def run_analysis_pipeline(
 
         stage(AgentStage.REPORT_GENERATED, 85)
         started = time.perf_counter()
-        analysis, report_degraded = write_report(
+        analysis, report_degraded, report_outcome = write_report(
             requirements, candidates, decisions, scoring, use_llm=use_llm
         )
         degraded = degraded or report_degraded
-        save_stage(AgentStage.REPORT_GENERATED, "degraded" if report_degraded else "validated", started, {"requirements": requirements, "decisions": decisions, "score": scoring}, analysis)
+        save_stage(
+            AgentStage.REPORT_GENERATED,
+            "degraded" if report_degraded else "validated",
+            started,
+            {"requirements": requirements, "decisions": decisions, "score": scoring},
+            analysis,
+            error=report_outcome.validation_error,
+            retry_count=report_outcome.retry_count,
+        )
 
         stage(AgentStage.VALIDATED, 100)
         update_analysis_run(

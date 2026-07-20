@@ -5,9 +5,14 @@ import re
 
 from pydantic import BaseModel, Field
 
-from app.agent_pipeline.structured_runner import StructuredStageError, run_structured
+from app.agent_pipeline.structured_runner import StageOutcome, run_structured
 from app.rag.resume_retriever import requirement_query, retrieve_resume_chunks
-from app.schemas.agent_pipeline import EvidenceCandidate, EvidenceDecision, JDRequirement
+from app.schemas.agent_pipeline import (
+    EvidenceCandidate,
+    EvidenceDecision,
+    JDRequirement,
+    ResumeChunk,
+)
 
 
 class EvidenceDecisionBundle(BaseModel):
@@ -16,28 +21,49 @@ class EvidenceDecisionBundle(BaseModel):
 
 def retrieve_candidates(
     resume_text: str, requirements: list[JDRequirement], top_k: int = 3
-) -> dict[str, list[EvidenceCandidate]]:
+) -> tuple[dict[str, list[EvidenceCandidate]], dict[str, ResumeChunk]]:
     candidates: dict[str, list[EvidenceCandidate]] = {}
+    resume_chunks: dict[str, ResumeChunk] = {}
     for requirement in requirements:
         chunks = retrieve_resume_chunks(
             resume_text, requirement_query(requirement.skill), top_k=top_k
         )
         requirement_candidates: list[EvidenceCandidate] = []
         for index, chunk in enumerate(chunks):
+            resume_chunk = resume_chunks.setdefault(
+                chunk.chunk_id,
+                ResumeChunk(
+                    id=chunk.chunk_id,
+                    section=chunk.section,
+                    content=chunk.content,
+                ),
+            )
             lexical_score = max(0.0, min(float(chunk.score), 1.0))
             candidate_id = f"evidence-{requirement.id}-{index + 1}"
             requirement_candidates.append(
                 EvidenceCandidate(
                     id=candidate_id,
                     requirement_id=requirement.id,
-                    chunk_id=chunk.chunk_id,
-                    snippet=f"[{chunk.section}] {chunk.content}",
+                    chunk_id=resume_chunk.id,
+                    snippet=f"[{resume_chunk.section}] {resume_chunk.content}",
                     lexical_score=lexical_score,
                     rerank_score=lexical_score,
                 )
             )
         candidates[requirement.id] = requirement_candidates
-    return candidates
+    validate_candidate_chunks(candidates, resume_chunks)
+    return candidates, resume_chunks
+
+
+def validate_candidate_chunks(
+    candidates: dict[str, list[EvidenceCandidate]],
+    resume_chunks: dict[str, ResumeChunk],
+) -> None:
+    chunk_ids = set(resume_chunks)
+    for items in candidates.values():
+        for candidate in items:
+            if candidate.chunk_id not in chunk_ids:
+                raise ValueError(f"candidate {candidate.id} 引用了不存在的 ResumeChunk")
 
 
 def rule_judge(
@@ -89,6 +115,8 @@ def validate_decisions(
     candidate_map = {item.id: item for items in candidates.values() for item in items}
     candidate_ids = set(candidate_map)
     decision_ids = {item.requirement_id for item in decisions}
+    if len(decisions) != len(requirements) or len(decision_ids) != len(decisions):
+        raise ValueError("Evidence Judge 不得重复裁决同一 requirement")
     if decision_ids != requirement_ids:
         raise ValueError("Evidence Judge 必须为每条岗位要求返回一个 decision")
     for decision in decisions:
@@ -108,7 +136,7 @@ def judge_evidence(
     candidates: dict[str, list[EvidenceCandidate]],
     *,
     use_llm: bool,
-) -> tuple[list[EvidenceDecision], bool]:
+) -> tuple[list[EvidenceDecision], bool, StageOutcome]:
     candidate_payload = {
         key: [item.model_dump() for item in value] for key, value in candidates.items()
     }
@@ -122,13 +150,21 @@ def judge_evidence(
     candidates={json.dumps(candidate_payload, ensure_ascii=False)}
     """
     try:
-        bundle = run_structured(
+        outcome = run_structured(
             prompt=prompt,
             output_model=EvidenceDecisionBundle,
             expected_output="包含 decisions 数组的 JSON 对象",
             enabled=use_llm,
         )
-        validate_decisions(requirements, candidates, bundle.decisions)
-        return bundle.decisions, False
-    except (StructuredStageError, ValueError):
-        return rule_judge(requirements, candidates), True
+        if outcome.value is None:
+            return rule_judge(requirements, candidates), True, outcome
+        validate_decisions(requirements, candidates, outcome.value.decisions)
+        return outcome.value.decisions, outcome.degraded, outcome
+    except ValueError as error:
+        fallback = StageOutcome(
+            value=None,
+            retry_count=outcome.retry_count if "outcome" in locals() else 0,
+            validation_error=f"evidence validation: {type(error).__name__}: {str(error)[:400]}",
+            degraded=True,
+        )
+        return rule_judge(requirements, candidates), True, fallback

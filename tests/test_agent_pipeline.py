@@ -4,13 +4,18 @@ from app import database
 from app.agent_pipeline.evidence_judge import validate_decisions
 from app.agent_pipeline.jd_extractor import validate_requirement_quotes
 from app.agent_pipeline.orchestrator import run_analysis_pipeline
+from app.agent_pipeline.report_writer import write_report
 from app.agent_pipeline.scorer import score_requirements
+from app.agent_pipeline.structured_runner import StageOutcome, run_structured
 from app.config import settings
 from app.schemas.agent_pipeline import (
     EvidenceCandidate,
     EvidenceDecision,
+    ReportNarrative,
     JDRequirement,
 )
+from app.agent_pipeline.evidence_judge import EvidenceDecisionBundle
+from app.agent_pipeline.jd_extractor import JDRequirementBundle
 
 
 def _requirement() -> JDRequirement:
@@ -60,6 +65,78 @@ def test_decision_rejects_unknown_evidence_id():
         validate_decisions([requirement], {"req-1": [candidate]}, [decision])
 
 
+def test_partial_requires_evidence_id():
+    with pytest.raises(ValueError, match="partial"):
+        EvidenceDecision(
+            requirement_id="req-1",
+            status="partial",
+            evidence_ids=[],
+            confidence=0.5,
+            rationale="只有部分相关信息",
+        )
+
+
+def test_decisions_reject_duplicate_requirement_ids():
+    requirement = _requirement()
+    candidate = EvidenceCandidate(
+        id="evidence-1",
+        requirement_id="req-1",
+        chunk_id="resume-1",
+        snippet="项目中使用 Python",
+        lexical_score=0.8,
+    )
+    decision = EvidenceDecision(
+        requirement_id="req-1",
+        status="supported",
+        evidence_ids=[candidate.id],
+        confidence=0.9,
+        rationale="有证据",
+    )
+    with pytest.raises(ValueError, match="重复"):
+        validate_decisions([requirement], {"req-1": [candidate]}, [decision, decision])
+
+
+def test_decisions_reject_cross_requirement_evidence():
+    first = _requirement()
+    second = first.model_copy(update={"id": "req-2", "skill": "FastAPI"})
+    first_candidate = EvidenceCandidate(
+        id="evidence-1",
+        requirement_id="req-1",
+        chunk_id="resume-1",
+        snippet="项目中使用 Python",
+        lexical_score=0.8,
+    )
+    second_candidate = EvidenceCandidate(
+        id="evidence-2",
+        requirement_id="req-2",
+        chunk_id="resume-2",
+        snippet="项目中使用 FastAPI",
+        lexical_score=0.8,
+    )
+    decisions = [
+        EvidenceDecision(
+            requirement_id="req-1",
+            status="supported",
+            evidence_ids=[second_candidate.id],
+            confidence=0.9,
+            rationale="错误跨 requirement 引用",
+        ),
+        EvidenceDecision(
+            requirement_id="req-2",
+            status="supported",
+            evidence_ids=[second_candidate.id],
+            confidence=0.9,
+            rationale="有证据",
+        ),
+    ]
+    with pytest.raises(ValueError, match="其他岗位要求"):
+        validate_decisions(
+            [first, second],
+            {"req-1": [first_candidate], "req-2": [second_candidate]},
+            decisions,
+        )
+
+
 def test_score_is_deterministic_and_model_cannot_choose_total():
     requirement = _requirement()
     decision = EvidenceDecision(
@@ -73,6 +150,182 @@ def test_score_is_deterministic_and_model_cannot_choose_total():
     assert result.score == 85
     assert result.must_coverage == 1
     assert result.project_relevance == 1
+
+
+def test_report_writer_ignores_factual_fields_from_llm(monkeypatch):
+    requirement = _requirement()
+    candidate = EvidenceCandidate(
+        id="evidence-1",
+        requirement_id="req-1",
+        chunk_id="resume-1",
+        snippet="项目中使用 Python",
+        lexical_score=0.8,
+    )
+    decision = EvidenceDecision(
+        requirement_id="req-1",
+        status="supported",
+        evidence_ids=[candidate.id],
+        confidence=0.9,
+        rationale="有证据",
+    )
+    score = score_requirements([requirement], [decision], "项目经历：Python 后端服务")
+    monkeypatch.setattr(
+        settings,
+        "deepseek_api_key",
+        "test-key",
+    )
+    responses = iter(
+        [
+            (
+                '{"summary":"模型给出的叙事摘要足够长且不改变事实字段。",'
+                '"resume_bullets":["请基于真实项目补充量化结果"],'
+                '"matched_skills":["Docker"]}'
+            ),
+            (
+                '{"summary":"修复后的叙事摘要足够长且不改变事实字段。",'
+                '"resume_bullets":["请基于真实项目补充量化结果"]}'
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "app.agent_pipeline.structured_runner._call_agent",
+        lambda *_args: next(responses),
+    )
+
+    report, degraded, outcome = write_report(
+        [requirement],
+        {"req-1": [candidate]},
+        [decision],
+        score,
+        use_llm=True,
+    )
+
+    assert degraded is False
+    assert outcome.retry_count == 1
+    assert report.score == score.score
+    assert report.matched_skills == ["Python"]
+    assert report.missing_skills == []
+    assert report.requirement_matches[0].status == "supported"
+    assert report.resume_bullets == ["请基于真实项目补充量化结果"]
+
+
+def test_structured_runner_repairs_once_and_returns_outcome(monkeypatch):
+    monkeypatch.setattr(settings, "deepseek_api_key", "test-key")
+    responses = iter(
+        [
+            '{"requirements": "invalid"}',
+            '{"requirements": []}',
+        ]
+    )
+    monkeypatch.setattr(
+        "app.agent_pipeline.structured_runner._call_agent",
+        lambda *_args: next(responses),
+    )
+
+    outcome = run_structured(
+        prompt="test",
+        output_model=JDRequirementBundle,
+        expected_output="requirements JSON",
+        enabled=True,
+    )
+
+    assert outcome.value is not None
+    assert outcome.retry_count == 1
+    assert outcome.validation_error == ""
+    assert outcome.degraded is False
+
+
+def test_structured_runner_summarizes_failed_repair(monkeypatch):
+    monkeypatch.setattr(settings, "deepseek_api_key", "test-key")
+    monkeypatch.setattr(
+        "app.agent_pipeline.structured_runner._call_agent",
+        lambda *_args: '{"requirements": "invalid"}',
+    )
+
+    outcome = run_structured(
+        prompt="candidate resume secret",
+        output_model=JDRequirementBundle,
+        expected_output="requirements JSON",
+        enabled=True,
+    )
+
+    assert outcome.value is None
+    assert outcome.retry_count == 1
+    assert outcome.degraded is True
+    assert "candidate resume secret" not in outcome.validation_error
+    assert len(outcome.validation_error) < 500
+
+
+def test_pipeline_success_path_uses_mocked_structured_stages(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "pipeline-success.db")
+    monkeypatch.setattr(settings, "deepseek_api_key", "test-key")
+    database.init_db()
+    session = database.create_copilot_session(None, "Python 后端开发实习")
+    created = database.create_copilot_message_and_turn(
+        session["id"], "岗位要求 Python，负责后端项目开发和接口维护。" * 4
+    )
+    assert created is not None
+    _, turn = created
+    requirement = JDRequirement(
+        id="req-1",
+        text="Python",
+        skill="Python",
+        category="must",
+        weight=2,
+        source_quote="岗位要求 Python",
+    )
+    candidate = EvidenceCandidate(
+        id="evidence-req-1-1",
+        requirement_id="req-1",
+        chunk_id="resume-1",
+        snippet="[项目经历] 使用 Python 开发后端服务",
+        lexical_score=0.9,
+        rerank_score=0.9,
+    )
+    decision = EvidenceDecision(
+        requirement_id="req-1",
+        status="supported",
+        evidence_ids=[candidate.id],
+        confidence=0.9,
+        rationale="有直接证据",
+    )
+    monkeypatch.setattr(
+        "app.agent_pipeline.jd_extractor.run_structured",
+        lambda **_: StageOutcome(value=JDRequirementBundle(requirements=[requirement])),
+    )
+    monkeypatch.setattr(
+        "app.agent_pipeline.evidence_judge.run_structured",
+        lambda **_: StageOutcome(value=EvidenceDecisionBundle(decisions=[decision])),
+    )
+    monkeypatch.setattr(
+        "app.agent_pipeline.report_writer.run_structured",
+        lambda **_: StageOutcome(
+            value=ReportNarrative(summary="成功路径的报告叙事结果已经通过结构化校验。")
+        ),
+    )
+
+    result = run_analysis_pipeline(
+        turn_id=turn["id"],
+        resume_text="项目经历：使用 Python 开发后端服务。" * 3,
+        jd_text="岗位要求 Python，负责后端项目开发和接口维护。" * 4,
+        target_role="Python 后端开发实习",
+        use_llm=True,
+    )
+
+    assert result.degraded is False
+    assert result.analysis.matched_skills == ["Python"]
+    runs = database.list_analysis_runs(turn["id"])
+    stages = database.list_agent_stage_runs(runs[0]["id"])
+    assert runs[0]["status"] == "completed"
+    assert all(item["status"] == "validated" for item in stages)
+    with database.sqlite3.connect(database.DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT chunks_json, candidates_json, decision_json FROM requirement_evidence WHERE analysis_run_id = ?",
+            (runs[0]["id"],),
+        ).fetchone()
+    assert '"id": "resume-1"' in row[0]
+    assert '"chunk_id": "resume-1"' in row[1]
+    assert '"evidence_ids": ["evidence-req-1-1"]' in row[2]
 
 
 def test_pipeline_falls_back_when_llm_is_unavailable(tmp_path, monkeypatch):
@@ -113,4 +366,3 @@ def test_pipeline_falls_back_when_llm_is_unavailable(tmp_path, monkeypatch):
             (runs[0]["id"],),
         ).fetchone()[0]
     assert evidence_count == len(result.requirements)
-

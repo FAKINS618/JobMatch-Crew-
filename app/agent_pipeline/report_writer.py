@@ -2,9 +2,15 @@
 
 import json
 
-from app.agent_pipeline.structured_runner import StructuredStageError, run_structured
+from app.agent_pipeline.structured_runner import StageOutcome, run_structured
 from app.schemas import ActionPlanItem, InterviewQuestion, JobMatchAnalysis, RequirementMatch, ScoreDimension
-from app.schemas.agent_pipeline import EvidenceCandidate, EvidenceDecision, JDRequirement, ScoringResult
+from app.schemas.agent_pipeline import (
+    EvidenceCandidate,
+    EvidenceDecision,
+    JDRequirement,
+    ReportNarrative,
+    ScoringResult,
+)
 
 
 def _deterministic_report(
@@ -74,7 +80,7 @@ def write_report(
     score: ScoringResult,
     *,
     use_llm: bool,
-) -> tuple[JobMatchAnalysis, bool]:
+) -> tuple[JobMatchAnalysis, bool, StageOutcome]:
     deterministic = _deterministic_report(requirements, candidates, decisions, score)
     structured_input = {
         "requirements": [item.model_dump() for item in requirements],
@@ -83,20 +89,36 @@ def write_report(
     }
     prompt = f"""
     你是报告表达 Agent。只能使用下面的结构化岗位要求、证据裁决和确定性评分。
-    不得看到或推断完整简历和 JD，不得修改 score，不得把建议写成已验证事实。
-    输出必须符合 JobMatchAnalysis JSON schema，只生成摘要、风险、面试题和行动建议。
+    不得看到或推断完整简历和 JD，不得把建议写成已验证事实。
+    输出必须符合 ReportNarrative JSON schema，只生成摘要、风险、面试题和行动建议。
 
     {json.dumps(structured_input, ensure_ascii=False)}
     """
     try:
-        result = run_structured(
+        outcome = run_structured(
             prompt=prompt,
-            output_model=JobMatchAnalysis,
-            expected_output="符合 JobMatchAnalysis 的 JSON 对象",
+            output_model=ReportNarrative,
+            expected_output="符合 ReportNarrative 的 JSON 对象",
             enabled=use_llm,
         )
-        if result.score != score.score:
-            raise ValueError("报告 Agent 不得修改确定性评分")
-        return result, False
-    except (StructuredStageError, ValueError):
-        return deterministic, True
+        if outcome.value is None:
+            return deterministic, True, outcome
+        narrative = outcome.value
+        merged = deterministic.model_copy(
+            update={
+                "summary": narrative.summary,
+                "resume_bullets": narrative.resume_bullets,
+                "interview_questions": narrative.interview_questions,
+                "action_plan": narrative.action_plan,
+                "risk_points": narrative.risk_points,
+            }
+        )
+        return merged, outcome.degraded, outcome
+    except Exception as error:
+        # Keep the deterministic facts even if a caller supplies a broken mock.
+        fallback = StageOutcome(
+            value=None,
+            validation_error=f"report merge: {type(error).__name__}: {str(error)[:400]}",
+            degraded=True,
+        )
+        return deterministic, True, fallback

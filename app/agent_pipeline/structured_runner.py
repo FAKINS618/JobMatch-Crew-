@@ -1,6 +1,7 @@
 """Small, schema-first wrapper around CrewAI task output."""
 
 import json
+from dataclasses import dataclass
 from typing import TypeVar
 
 from crewai import Agent, Crew, Process, Task
@@ -16,6 +17,22 @@ T = TypeVar("T", bound=BaseModel)
 
 class StructuredStageError(RuntimeError):
     """A stage could not produce a validated structured result."""
+
+
+@dataclass(frozen=True)
+class StageOutcome:
+    """Validated stage value plus bounded failure/retry metadata."""
+
+    value: T | None
+    retry_count: int = 0
+    validation_error: str = ""
+    degraded: bool = False
+
+
+def _error_summary(error: Exception) -> str:
+    """Keep diagnostics useful without persisting model prompts or raw output."""
+    message = " ".join(str(error).split())
+    return f"{type(error).__name__}: {message[:160]}"
 
 
 def _call_agent(prompt: str, expected_output: str) -> str:
@@ -45,15 +62,24 @@ def run_structured(
     output_model: type[T],
     expected_output: str,
     enabled: bool,
-) -> T:
+) -> StageOutcome:
     """Run one structured stage and repair invalid JSON at most once."""
     if not enabled or not settings.deepseek_api_key:
-        raise StructuredStageError("LLM 未配置，使用规则降级")
+        return StageOutcome(
+            value=None,
+            validation_error="StructuredStageError: LLM 未配置，使用规则降级",
+            degraded=True,
+        )
 
-    raw = _call_agent(prompt, expected_output)
+    try:
+        raw = _call_agent(prompt, expected_output)
+    except Exception as error:
+        return StageOutcome(value=None, validation_error=_error_summary(error), degraded=True)
     parsed = extract_json_block(raw)
     try:
-        return output_model.model_validate(parsed)
+        if not parsed:
+            raise ValueError("未找到可解析的 JSON 对象")
+        return StageOutcome(value=output_model.model_validate(parsed))
     except Exception as first_error:
         repair_prompt = f"""
         下面的模型输出没有通过 JSON schema 校验。
@@ -65,12 +91,30 @@ def run_structured(
 
         只返回一个 JSON 对象，不要 Markdown。
         """
-        repaired = _call_agent(repair_prompt, expected_output)
+        try:
+            repaired = _call_agent(repair_prompt, expected_output)
+        except Exception as error:
+            return StageOutcome(
+                value=None,
+                retry_count=1,
+                validation_error=(
+                    f"initial validation: {_error_summary(first_error)}; "
+                    f"repair call: {_error_summary(error)}"
+                ),
+                degraded=True,
+            )
         repaired_json = extract_json_block(repaired)
         try:
-            return output_model.model_validate(repaired_json)
+            return StageOutcome(
+                value=output_model.model_validate(repaired_json), retry_count=1
+            )
         except Exception as second_error:
-            raise StructuredStageError(
-                f"结构化输出校验失败：{first_error}; 修复重试失败：{second_error}"
-            ) from second_error
-
+            return StageOutcome(
+                value=None,
+                retry_count=1,
+                validation_error=(
+                    f"initial validation: {_error_summary(first_error)}; "
+                    f"repair validation: {_error_summary(second_error)}"
+                ),
+                degraded=True,
+            )
