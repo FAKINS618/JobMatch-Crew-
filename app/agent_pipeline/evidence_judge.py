@@ -15,6 +15,7 @@ from app.agent_pipeline.retrieval import (
     TfidfResumeRetriever,
 )
 from app.agent_pipeline.structured_runner import StageOutcome, run_structured
+from app.config import settings
 from app.schemas.agent_pipeline import (
     EvidenceCandidate,
     EvidenceDecision,
@@ -25,6 +26,9 @@ from app.schemas.agent_pipeline import (
 
 class EvidenceDecisionBundle(BaseModel):
     decisions: list[EvidenceDecision] = Field(default_factory=list, max_length=20)
+
+
+EVIDENCE_PROMPT_VERSION = "v1"
 
 
 def retrieve_candidates(
@@ -183,6 +187,15 @@ def judge_evidence(
             output_model=EvidenceDecisionBundle,
             expected_output="包含 decisions 数组的 JSON 对象",
             enabled=use_llm,
+            cache_namespace="analysis:evidence_judgement",
+            cache_identity={
+                "requirements": [item.model_dump(mode="json") for item in requirements],
+                "candidates": candidate_payload,
+                "model": settings.model,
+                "prompt_version": EVIDENCE_PROMPT_VERSION,
+                "schema_version": "EvidenceDecisionBundle-v1",
+            },
+            cache_ttl_seconds=24 * 60 * 60,
         )
         if outcome.value is None:
             return rule_judge(requirements, candidates), True, outcome

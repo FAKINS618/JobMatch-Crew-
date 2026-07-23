@@ -1,6 +1,7 @@
 """将 CrewAI 多 Agent 求职匹配包装为可恢复、可渐进展示的副驾回合。"""
 
 import logging
+import json
 
 from crewai import Agent, Crew, Process, Task
 
@@ -13,6 +14,8 @@ from app.database import (
     update_copilot_artifact,
     update_copilot_turn,
 )
+from app.cache import build_cache_key, content_hash, get_cache
+from app.config import settings
 from app.agent_pipeline import run_analysis_pipeline
 from app.schemas.agent_pipeline import AgentStage
 from app.report_parser import extract_json_block
@@ -22,6 +25,7 @@ from app.llm_factory import build_llm
 from app.rag.resume_retriever import requirement_query, retrieve_resume_chunks
 from app.schemas import ActionPlanItem, JobMatchAnalysis, RequirementMatch, ScoreDimension
 from app.services.market_profile_service import SKILL_KEYWORDS
+from app.services.copilot_context_service import get_copilot_context
 
 
 logger = logging.getLogger(__name__)
@@ -262,8 +266,29 @@ def _run_multi_agent_analysis(
 _run_fast_agent_analysis = _run_multi_agent_analysis
 
 
+COPILOT_PROMPT_VERSION = "v2-context-snapshot"
+
+
 def _run_follow_up_response(resume_text: str, report: dict, question: str) -> str:
     """基于当前活动报告回答追问，不要求用户重复粘贴岗位 JD。"""
+    # Keep resume_text in the compatibility signature, but deliberately do not
+    # resend it. The report context snapshot contains only validated facts.
+    del resume_text
+    context = report.get("_copilot_context") or {
+        "snapshot": {
+            "report_id": report.get("id"),
+            "target_role": report.get("target_role") or "目标岗位",
+            "analysis": {
+                "score": report.get("score"),
+                "summary": str(report.get("markdown_report") or "")[:3000],
+            },
+            "evidence_chain": {"items": []},
+        },
+        "revision": "uncached",
+        "messages": [],
+    }
+    snapshot = context.get("snapshot") or {}
+    recent_messages = context.get("messages") or []
     advisor = Agent(
         role="求职副驾追问顾问",
         goal="基于同一份岗位、简历和已有分析回答用户追问，并给出可执行建议",
@@ -271,24 +296,18 @@ def _run_follow_up_response(resume_text: str, report: dict, question: str) -> st
         llm=build_llm(),
         verbose=False,
     )
-    prior_analysis = report.get("parsed_result") or report.get("markdown_report") or "暂无已保存分析"
     task = Task(
         description=f"""
-当前目标岗位：{report.get('target_role') or '目标岗位'}
+以下是当前报告的受控上下文快照，只能使用其中的事实和证据：
+{json.dumps(snapshot, ensure_ascii=False)}
 
-原始岗位 JD：
-{str(report.get('jd_text') or '')[:8000]}
-
-候选人简历：
-{resume_text[:8000]}
-
-上一轮结构化分析：
-{str(prior_analysis)[:10000]}
+最近的少量会话消息：
+{json.dumps(recent_messages, ensure_ascii=False)}
 
 用户追问：
 {question}
 
-请直接用中文回答追问。回答需要引用岗位或简历中的依据，并在结尾给出 1 到 3 个下一步动作。
+请直接用中文回答追问。回答只能引用上下文快照中的岗位、简历证据或人工反馈；证据不足时明确说明，并在结尾给出 1 到 3 个下一步动作。
 不要要求用户重新粘贴岗位 JD，不要输出 JSON 或 Markdown 标题。
         """,
         expected_output="面向当前岗位上下文的中文追问回答",
@@ -303,6 +322,35 @@ def _run_follow_up_response(resume_text: str, report: dict, question: str) -> st
     answer = str(result).strip()
     if not answer:
         raise ValueError("追问 Agent 没有返回内容")
+    return answer
+
+
+def _run_cached_follow_up_response(
+    resume_text: str, report: dict, question: str, session_id: int
+) -> str:
+    """Use a compact report snapshot and cache exact repeated questions."""
+    context = get_copilot_context(report, session_id)
+    answer_key = build_cache_key(
+        "copilot:answer",
+        {
+            "report_id": report.get("id"),
+            "context_revision": context["revision"],
+            "question_hash": content_hash(" ".join(question.split())),
+            "model": settings.model,
+            "prompt_version": COPILOT_PROMPT_VERSION,
+        },
+    )
+    cache = get_cache()
+    if settings.cache_enabled:
+        cached = cache.get_json(answer_key)
+        if isinstance(cached, dict) and isinstance(cached.get("answer"), str):
+            return cached["answer"]
+
+    report_with_context = dict(report)
+    report_with_context["_copilot_context"] = context
+    answer = _run_follow_up_response(resume_text, report_with_context, question)
+    if settings.cache_enabled and answer:
+        cache.set_json(answer_key, {"answer": answer}, 24 * 60 * 60)
     return answer
 
 
@@ -383,7 +431,9 @@ def run_copilot_turn(turn_id: int) -> None:
             report_id=int(active_report["id"]),
         )
         try:
-            answer = _run_follow_up_response(resume["raw_text"], active_report, jd_text)
+            answer = _run_cached_follow_up_response(
+                resume["raw_text"], active_report, jd_text, int(session["id"])
+            )
         except Exception:
             logger.exception("Copilot follow-up analysis failed")
             save_copilot_assistant_message(

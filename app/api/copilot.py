@@ -41,6 +41,7 @@ from app.schemas.agent_pipeline import (
 )
 from app.config import settings
 from app.services.copilot_service import run_copilot_turn
+from app.services.copilot_context_service import invalidate_report_context
 from app.services.analysis_task_service import run_auto_market_match_task
 
 
@@ -147,6 +148,9 @@ def submit_evidence_feedback(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    turn = get_copilot_turn(turn_id)
+    if turn is not None:
+        invalidate_report_context(turn.get("report_id"))
     return EvidenceFeedback.model_validate(created)
 
 

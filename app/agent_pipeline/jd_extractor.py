@@ -4,12 +4,17 @@ from pydantic import BaseModel, Field
 
 from app.agent_pipeline.evidence_matching import contains_skill, find_skill_spans
 from app.agent_pipeline.structured_runner import StageOutcome, run_structured
+from app.cache import content_hash
+from app.config import settings
 from app.schemas.agent_pipeline import JDRequirement
 from app.services.market_profile_service import SKILL_KEYWORDS
 
 
 class JDRequirementBundle(BaseModel):
     requirements: list[JDRequirement] = Field(default_factory=list, max_length=20)
+
+
+JD_PROMPT_VERSION = "v1"
 
 
 def validate_requirement_quotes(requirements: list[JDRequirement], jd_text: str) -> None:
@@ -83,6 +88,15 @@ def extract_requirements(
             output_model=JDRequirementBundle,
             expected_output="包含 requirements 数组的 JSON 对象",
             enabled=use_llm,
+            cache_namespace="analysis:jd_requirements",
+            cache_identity={
+                "jd_hash": content_hash(jd_text),
+                "target_role": target_role,
+                "model": settings.model,
+                "prompt_version": JD_PROMPT_VERSION,
+                "schema_version": "JDRequirementBundle-v1",
+            },
+            cache_ttl_seconds=7 * 24 * 60 * 60,
         )
         if outcome.value is None:
             return rule_extract_requirements(jd_text), True, outcome

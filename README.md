@@ -148,6 +148,26 @@ Streamlit 兼容工作台：http://localhost:8501
 接口文档：http://127.0.0.1:8000/docs
 ```
 
+## 可选 Redis 缓存
+
+项目使用 Redis 作为可选加速层，SQLite 仍然保存简历版本、报告、证据链、人工反馈和会话历史。Redis 未启动或连接失败时，系统会自动回退到现有 SQLite + LLM 流程，不影响核心功能。
+
+复制 `.env.example` 为 `.env` 后，可以按需启用：
+
+```env
+CACHE_ENABLED=true
+REDIS_URL=redis://localhost:6379/0
+CACHE_PREFIX=jm:v1
+CACHE_FAIL_OPEN=true
+```
+
+当前缓存内容包括：
+
+- JD 要求抽取、证据裁决、报告表达等已通过 Pydantic 校验的结构化阶段结果；
+- 副驾报告上下文快照和相同报告下的精确重复追问回答。
+
+缓存 Key 只使用版本、ID 和哈希，不包含简历、JD 或问题原文。上下文快照只保留报告事实、证据片段和最近少量消息，不会重复向模型发送整份简历和完整 JD。人工证据反馈会改变上下文版本，使旧缓存不能继续使用。Redis value 可能包含受控证据片段，因此 Redis 只应运行在本机或私有网络中。
+
 ## 测试
 
 ```bash

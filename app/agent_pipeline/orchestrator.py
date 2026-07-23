@@ -96,7 +96,7 @@ def run_analysis_pipeline(
         degraded = degraded or jd_degraded
         save_stage(
             AgentStage.JD_EXTRACTED,
-            "degraded" if jd_degraded else "validated",
+            "cached" if jd_outcome.cache_hit else "degraded" if jd_degraded else "validated",
             started,
             {"target_role": target_role},
             requirements,
@@ -135,7 +135,7 @@ def run_analysis_pipeline(
         degraded = degraded or judge_degraded
         save_stage(
             AgentStage.EVIDENCE_JUDGED,
-            "degraded" if judge_degraded else "validated",
+            "cached" if judge_outcome.cache_hit else "degraded" if judge_degraded else "validated",
             started,
             candidates,
             decisions,
@@ -171,7 +171,7 @@ def run_analysis_pipeline(
         degraded = degraded or report_degraded
         save_stage(
             AgentStage.REPORT_GENERATED,
-            "degraded" if report_degraded else "validated",
+            "cached" if report_outcome.cache_hit else "degraded" if report_degraded else "validated",
             started,
             {"requirements": requirements, "decisions": decisions, "score": scoring},
             analysis,

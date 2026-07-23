@@ -1959,6 +1959,29 @@ def get_copilot_turn(turn_id: int) -> dict | None:
         return _turn_row_to_dict(conn, row) if row else None
 
 
+def get_copilot_report_source_turn(report_id: int) -> int | None:
+    """Return the first analysis turn that produced a report."""
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT id FROM analysis_turns WHERE report_id = ? ORDER BY id ASC LIMIT 1",
+            (report_id,),
+        ).fetchone()
+        return int(row[0]) if row else None
+
+
+def list_recent_copilot_messages(session_id: int, limit: int = 4) -> list[dict]:
+    """Read only a small recent window for follow-up context construction."""
+    safe_limit = max(1, min(limit, 8))
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, role, content, turn_id, created_at FROM copilot_messages "
+            "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+            (session_id, safe_limit),
+        ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+
 def create_copilot_message_and_turn(session_id: int, content: str) -> tuple[dict, dict] | None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row

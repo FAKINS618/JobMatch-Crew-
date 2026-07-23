@@ -3,6 +3,7 @@
 import json
 
 from app.agent_pipeline.structured_runner import StageOutcome, run_structured
+from app.config import settings
 from app.schemas import ActionPlanItem, InterviewQuestion, JobMatchAnalysis, RequirementMatch, ScoreDimension
 from app.schemas.agent_pipeline import (
     EvidenceCandidate,
@@ -11,6 +12,9 @@ from app.schemas.agent_pipeline import (
     ReportNarrative,
     ScoringResult,
 )
+
+
+REPORT_PROMPT_VERSION = "v1"
 
 
 def _deterministic_report(
@@ -100,6 +104,14 @@ def write_report(
             output_model=ReportNarrative,
             expected_output="符合 ReportNarrative 的 JSON 对象",
             enabled=use_llm,
+            cache_namespace="analysis:report_narrative",
+            cache_identity={
+                "structured_input": structured_input,
+                "model": settings.model,
+                "prompt_version": REPORT_PROMPT_VERSION,
+                "schema_version": "ReportNarrative-v1",
+            },
+            cache_ttl_seconds=24 * 60 * 60,
         )
         if outcome.value is None:
             return deterministic, True, outcome

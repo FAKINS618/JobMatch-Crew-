@@ -1,10 +1,15 @@
 from crewai import Agent, Crew, Process, Task
 from pydantic import ValidationError
 
+from app.cache import build_cache_key, content_hash, get_cache
+from app.config import settings
 from app.llm_factory import build_llm
 from app.prompt_loader import load_prompt
 from app.report_parser import extract_json_block
 from app.schemas import ResumeProfile
+
+
+RESUME_PARSER_PROMPT_VERSION = "v1"
 
 
 def _as_string_list(value: object) -> list[str]:
@@ -88,6 +93,24 @@ def call_resume_parser_llm(raw_text: str) -> str:
 
 
 def parse_resume_to_profile(raw_text: str) -> ResumeProfile:
+    cache_key = build_cache_key(
+        "resume:parse",
+        {
+            "resume_hash": content_hash(raw_text),
+            "model": settings.model,
+            "prompt_version": RESUME_PARSER_PROMPT_VERSION,
+            "schema_version": "ResumeProfile-v1",
+        },
+    )
+    cache = get_cache()
+    if settings.cache_enabled:
+        cached = cache.get_json(cache_key)
+        if isinstance(cached, dict):
+            try:
+                return ResumeProfile.model_validate(cached)
+            except ValidationError:
+                cache.delete(cache_key)
+
     raw_result = call_resume_parser_llm(raw_text)
     parsed = extract_json_block(raw_result)
 
@@ -95,6 +118,9 @@ def parse_resume_to_profile(raw_text: str) -> ResumeProfile:
         raise ValueError("简历结构化解析失败，请手动补充信息后重试")
 
     try:
-        return ResumeProfile.model_validate(normalize_resume_profile_payload(parsed))
+        profile = ResumeProfile.model_validate(normalize_resume_profile_payload(parsed))
+        if settings.cache_enabled:
+            cache.set_json(cache_key, profile.model_dump(mode="json"), 30 * 24 * 60 * 60)
+        return profile
     except ValidationError as exc:
         raise ValueError(f"简历结构化字段校验失败：{exc}") from exc

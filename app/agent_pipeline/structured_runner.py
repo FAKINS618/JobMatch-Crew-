@@ -1,15 +1,20 @@
 """Small, schema-first wrapper around CrewAI task output."""
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import TypeVar
 
 from crewai import Agent, Crew, Process, Task
 from pydantic import BaseModel
 
+from app.cache import build_cache_key, get_cache
 from app.config import settings
 from app.llm_factory import build_llm
 from app.report_parser import extract_json_block
+
+
+logger = logging.getLogger(__name__)
 
 
 T = TypeVar("T", bound=BaseModel)
@@ -27,6 +32,7 @@ class StageOutcome:
     retry_count: int = 0
     validation_error: str = ""
     degraded: bool = False
+    cache_hit: bool = False
 
 
 def _error_summary(error: Exception) -> str:
@@ -62,6 +68,9 @@ def run_structured(
     output_model: type[T],
     expected_output: str,
     enabled: bool,
+    cache_namespace: str | None = None,
+    cache_identity: dict | None = None,
+    cache_ttl_seconds: int | None = None,
 ) -> StageOutcome:
     """Run one structured stage and repair invalid JSON at most once."""
     if not enabled or not settings.deepseek_api_key:
@@ -71,6 +80,23 @@ def run_structured(
             degraded=True,
         )
 
+    cache = get_cache()
+    cache_key = None
+    if cache_namespace and cache_identity and settings.cache_enabled:
+        cache_key = build_cache_key(cache_namespace, cache_identity)
+        cached = cache.get_json(cache_key)
+        if cached is not None:
+            try:
+                cached_value = cached.get("value", cached) if isinstance(cached, dict) else cached
+                return StageOutcome(
+                    value=output_model.model_validate(cached_value),
+                    cache_hit=True,
+                )
+            except Exception as error:
+                # A stale or incompatible cache entry must never block a fresh call.
+                cache.delete(cache_key)
+                logger.warning("Ignoring invalid structured cache entry: %s", _error_summary(error))
+
     try:
         raw = _call_agent(prompt, expected_output)
     except Exception as error:
@@ -79,7 +105,10 @@ def run_structured(
     try:
         if not parsed:
             raise ValueError("未找到可解析的 JSON 对象")
-        return StageOutcome(value=output_model.model_validate(parsed))
+        value = output_model.model_validate(parsed)
+        if cache_key and cache_ttl_seconds:
+            cache.set_json(cache_key, {"value": value.model_dump(mode="json")}, cache_ttl_seconds)
+        return StageOutcome(value=value)
     except Exception as first_error:
         repair_prompt = f"""
         下面的模型输出没有通过 JSON schema 校验。
@@ -105,9 +134,10 @@ def run_structured(
             )
         repaired_json = extract_json_block(repaired)
         try:
-            return StageOutcome(
-                value=output_model.model_validate(repaired_json), retry_count=1
-            )
+            value = output_model.model_validate(repaired_json)
+            if cache_key and cache_ttl_seconds:
+                cache.set_json(cache_key, {"value": value.model_dump(mode="json")}, cache_ttl_seconds)
+            return StageOutcome(value=value, retry_count=1)
         except Exception as second_error:
             return StageOutcome(
                 value=None,

@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     cors_allowed_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     sse_max_seconds: int = 600
     sse_poll_interval_seconds: float = 0.5
+    # Redis is an optional acceleration layer. SQLite remains the source of truth.
+    cache_enabled: bool = False
+    redis_url: str = "redis://localhost:6379/0"
+    cache_prefix: str = "jm:v1"
+    cache_fail_open: bool = True
+    redis_socket_connect_timeout_seconds: float = 0.2
+    redis_socket_timeout_seconds: float = 0.8
 
     model_config = SettingsConfigDict(
         env_file=".env",
