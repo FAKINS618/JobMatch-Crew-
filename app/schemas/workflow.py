@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.schemas.resume import ResumeProfile
+
 
 JobTargetStatus = Literal[
     "saved",
@@ -19,6 +21,9 @@ JobPriority = Literal["A", "B", "C"]
 ActionItemStatus = Literal["todo", "in_progress", "completed", "cancelled"]
 ActionPriority = Literal["high", "medium", "low"]
 EvidenceType = Literal["link", "note", "resume_version"]
+ResumeSuggestionStatus = Literal["pending", "accepted", "rejected", "edited"]
+InterviewPerformance = Literal["strong", "mixed", "needs_work"]
+InterviewResult = Literal["pending", "passed", "failed", "unknown"]
 
 
 class JobTargetCreate(BaseModel):
@@ -60,7 +65,11 @@ class JobTargetResponse(BaseModel):
 class ApplicationEventCreate(BaseModel):
     """补充记录投递过程中的不可变事件，不会改变岗位状态。"""
 
-    event_type: str = Field(min_length=2, max_length=64)
+    event_type: Literal[
+        "saved", "applied", "written_test", "interview", "offer", "rejected", "withdrawn",
+        "status:saved", "status:applied", "status:written_test", "status:interview",
+        "status:offer", "status:rejected", "status:withdrawn", "note",
+    ]
     occurred_at: datetime | None = None
     note: str = Field(default="", max_length=2000)
 
@@ -144,3 +153,80 @@ class DashboardSummary(BaseModel):
     in_progress_action_count: int = 0
     completed_action_count: int = 0
     evidence_count: int = 0
+
+class ResumeSuggestionResponse(BaseModel):
+    id: int
+    report_id: int
+    resume_version_id: int
+    suggestion_type: str
+    source_context: str = ""
+    suggested_text: str
+    edited_text: str = ""
+    status: ResumeSuggestionStatus = "pending"
+    created_at: str | None = None
+    updated_at: str | None = None
+    confirmed_at: str | None = None
+
+
+class ResumeSuggestionUpdate(BaseModel):
+    status: ResumeSuggestionStatus
+    edited_text: str = Field(default="", max_length=4000)
+
+
+class ResumeVersionFromSuggestionsCreate(BaseModel):
+    report_id: int = Field(gt=0)
+    source_resume_version_id: int = Field(gt=0)
+    suggestion_ids: list[int] = Field(default_factory=list, max_length=30)
+    version_name: str = Field(min_length=2, max_length=50)
+    target_role: str = Field(default="", max_length=120)
+    raw_text: str = Field(min_length=80)
+    profile: ResumeProfile
+
+
+class JobTargetTimelineResponse(BaseModel):
+    target: JobTargetResponse
+    events: list[ApplicationEventResponse] = Field(default_factory=list)
+    interview_reviews: list["InterviewReviewResponse"] = Field(default_factory=list)
+
+
+class InterviewReviewCreate(BaseModel):
+    round_number: int = Field(default=1, ge=1, le=20)
+    occurred_at: datetime | None = None
+    questions: list[str] = Field(default_factory=list, max_length=30)
+    performance: InterviewPerformance = "mixed"
+    feedback: str = Field(default="", max_length=4000)
+    result: InterviewResult = "unknown"
+    missing_skills: list[str] = Field(default_factory=list, max_length=20)
+    conclusion: str = Field(default="", max_length=4000)
+
+
+class InterviewReviewUpdate(BaseModel):
+    round_number: int | None = Field(default=None, ge=1, le=20)
+    occurred_at: datetime | None = None
+    questions: list[str] | None = Field(default=None, max_length=30)
+    performance: InterviewPerformance | None = None
+    feedback: str | None = Field(default=None, max_length=4000)
+    result: InterviewResult | None = None
+    missing_skills: list[str] | None = Field(default=None, max_length=20)
+    conclusion: str | None = Field(default=None, max_length=4000)
+
+
+class InterviewReviewResponse(BaseModel):
+    id: int
+    job_target_id: int
+    report_id: int
+    round_number: int
+    occurred_at: str | None = None
+    questions: list[str] = Field(default_factory=list)
+    performance: InterviewPerformance
+    feedback: str = ""
+    result: InterviewResult
+    missing_skills: list[str] = Field(default_factory=list)
+    conclusion: str = ""
+    actions_confirmed_at: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class InterviewActionConfirm(BaseModel):
+    skills: list[str] = Field(default_factory=list, max_length=20)
