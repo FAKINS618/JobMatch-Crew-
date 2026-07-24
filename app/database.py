@@ -14,6 +14,10 @@ from app.schemas.workflow import (
     ApplicationEventCreate,
     JobTargetCreate,
     JobTargetUpdate,
+    InterviewReviewCreate,
+    InterviewReviewUpdate,
+    ResumeSuggestionUpdate,
+    ResumeVersionFromSuggestionsCreate,
 )
 
 DB_PATH = settings.database_path
@@ -39,6 +43,11 @@ JOB_POST_EXTRA_COLUMNS = {
 
 SESSION_EXTRA_COLUMNS = {
     "active_report_id": "INTEGER",
+}
+
+RESUME_VERSION_EXTRA_COLUMNS = {
+    "parent_resume_version_id": "INTEGER",
+    "source_report_id": "INTEGER",
 }
 
 TURN_EXTRA_COLUMNS = {
@@ -229,6 +238,55 @@ def init_db() -> None:
                 FOREIGN KEY (resume_version_id) REFERENCES resume_versions(id)
             )
             """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS resume_suggestions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id INTEGER NOT NULL,
+                resume_version_id INTEGER NOT NULL,
+                suggestion_type TEXT NOT NULL,
+                source_context TEXT NOT NULL DEFAULT "",
+                suggested_text TEXT NOT NULL,
+                edited_text TEXT NOT NULL DEFAULT "",
+                status TEXT NOT NULL DEFAULT "pending",
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                confirmed_at TIMESTAMP,
+                UNIQUE(report_id, suggestion_type, suggested_text),
+                FOREIGN KEY (report_id) REFERENCES reports(id),
+                FOREIGN KEY (resume_version_id) REFERENCES resume_versions(id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_resume_suggestions_report ON resume_suggestions(report_id, status)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS interview_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_target_id INTEGER NOT NULL,
+                report_id INTEGER NOT NULL,
+                round_number INTEGER NOT NULL DEFAULT 1,
+                occurred_at TIMESTAMP,
+                questions_json TEXT NOT NULL DEFAULT '[]',
+                performance TEXT NOT NULL DEFAULT 'mixed',
+                feedback TEXT NOT NULL DEFAULT '',
+                result TEXT NOT NULL DEFAULT 'unknown',
+                missing_skills_json TEXT NOT NULL DEFAULT '[]',
+                conclusion TEXT NOT NULL DEFAULT '',
+                actions_confirmed_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(job_target_id, round_number),
+                FOREIGN KEY (job_target_id) REFERENCES job_targets(id),
+                FOREIGN KEY (report_id) REFERENCES reports(id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_interview_reviews_target ON interview_reviews(job_target_id, round_number)"
         )
         conn.execute(
             """
@@ -451,11 +509,19 @@ def init_db() -> None:
 
 
         _ensure_report_columns(conn)
+        _ensure_resume_version_columns(conn)
         _ensure_job_post_columns(conn)
         _ensure_session_columns(conn)
         _ensure_turn_columns(conn)
         _ensure_requirement_evidence_columns(conn)
         conn.commit()
+
+
+def _ensure_resume_version_columns(conn: sqlite3.Connection) -> None:
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(resume_versions)").fetchall()}
+    for column_name, column_type in RESUME_VERSION_EXTRA_COLUMNS.items():
+        if column_name not in existing_columns:
+            conn.execute(f"ALTER TABLE resume_versions ADD COLUMN {column_name} {column_type}")
 
 
 def _ensure_report_columns(conn: sqlite3.Connection) -> None:
@@ -2158,3 +2224,285 @@ def create_artifact_decision(artifact_id: int, decision: str, note: str) -> dict
         ).fetchone()
         conn.commit()
         return _with_display_times(dict(row))
+
+# --- Resume suggestion confirmation and interview review workflow ---
+
+def _suggestion_row_to_dict(row: sqlite3.Row) -> dict:
+    return _with_display_times(dict(row))
+
+
+def _ensure_report_suggestions(conn: sqlite3.Connection, report_id: int) -> None:
+    report = conn.execute(
+        "SELECT resume_version_id, parsed_result FROM reports WHERE id = ?", (report_id,)
+    ).fetchone()
+    if report is None or report["resume_version_id"] is None:
+        return
+    count = conn.execute(
+        "SELECT COUNT(*) FROM resume_suggestions WHERE report_id = ?", (report_id,)
+    ).fetchone()[0]
+    if count:
+        return
+    try:
+        parsed = json.loads(report["parsed_result"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        parsed = {}
+    candidates: list[tuple[str, str, str]] = []
+    for key, suggestion_type in (
+        ("resume_bullets", "resume_bullet"),
+        ("resume_improvement_suggestions", "resume_improvement"),
+    ):
+        values = parsed.get(key) or []
+        if isinstance(values, str):
+            values = [values]
+        if isinstance(values, list):
+            for value in values:
+                if isinstance(value, str) and value.strip():
+                    candidates.append((suggestion_type, key, value.strip()))
+    for suggestion_type, source_context, suggested_text in candidates[:30]:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO resume_suggestions
+                (report_id, resume_version_id, suggestion_type, source_context, suggested_text)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (report_id, report["resume_version_id"], suggestion_type, source_context, suggested_text),
+        )
+
+
+def list_resume_suggestions(report_id: int) -> list[dict] | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        if conn.execute("SELECT 1 FROM reports WHERE id = ?", (report_id,)).fetchone() is None:
+            return None
+        _ensure_report_suggestions(conn, report_id)
+        rows = conn.execute(
+            "SELECT * FROM resume_suggestions WHERE report_id = ? ORDER BY id", (report_id,)
+        ).fetchall()
+        conn.commit()
+        return [_suggestion_row_to_dict(row) for row in rows]
+
+
+def update_resume_suggestion(
+    suggestion_id: int, payload: ResumeSuggestionUpdate
+) -> dict | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        current = conn.execute(
+            "SELECT * FROM resume_suggestions WHERE id = ?", (suggestion_id,)
+        ).fetchone()
+        if current is None:
+            return None
+        edited_text = payload.edited_text.strip()
+        if payload.status == "edited" and not edited_text:
+            raise ValueError("编辑状态必须提供修改后的建议内容")
+        confirmed_at = "CURRENT_TIMESTAMP" if payload.status in {"accepted", "edited", "rejected"} else None
+        if confirmed_at:
+            conn.execute(
+                """
+                UPDATE resume_suggestions
+                SET status = ?, edited_text = ?, confirmed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (payload.status, edited_text, suggestion_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE resume_suggestions SET status = ?, edited_text = ?, confirmed_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (payload.status, edited_text, suggestion_id),
+            )
+        row = conn.execute("SELECT * FROM resume_suggestions WHERE id = ?", (suggestion_id,)).fetchone()
+        conn.commit()
+        return _suggestion_row_to_dict(row)
+
+
+def create_resume_version_from_suggestions(
+    payload: ResumeVersionFromSuggestionsCreate,
+) -> dict:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        report = conn.execute(
+            "SELECT resume_version_id FROM reports WHERE id = ?", (payload.report_id,)
+        ).fetchone()
+        if report is None:
+            raise ValueError("报告不存在")
+        if report["resume_version_id"] != payload.source_resume_version_id:
+            raise ValueError("报告与来源简历版本不匹配")
+        source = conn.execute(
+            "SELECT id, resume_id, target_role FROM resume_versions WHERE id = ?",
+            (payload.source_resume_version_id,),
+        ).fetchone()
+        if source is None:
+            raise ValueError("来源简历版本不存在")
+        ids = list(dict.fromkeys(payload.suggestion_ids))
+        if not ids:
+            raise ValueError("至少确认一条简历建议后才能创建新版本")
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"SELECT * FROM resume_suggestions WHERE report_id = ? AND resume_version_id = ? AND id IN ({placeholders})",
+            (payload.report_id, payload.source_resume_version_id, *ids),
+        ).fetchall()
+        if len(rows) != len(ids):
+            raise ValueError("存在不属于当前报告的简历建议")
+        if any(row["status"] not in {"accepted", "edited"} for row in rows):
+            raise ValueError("只能使用已接受或已编辑的简历建议创建新版本")
+        profile = ResumeProfile.model_validate(payload.profile)
+        conn.execute("UPDATE resumes SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (source["resume_id"],))
+        cursor = conn.execute(
+            """
+            INSERT INTO resume_versions
+                (resume_id, version_name, target_role, raw_text, profile_json,
+                 parent_resume_version_id, source_report_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source["resume_id"], payload.version_name, payload.target_role or source["target_role"] or "",
+                payload.raw_text, profile.model_dump_json(), payload.source_resume_version_id, payload.report_id,
+            ),
+        )
+        row = conn.execute(
+            "SELECT id, resume_id, version_name, target_role, raw_text, profile_json, created_at FROM resume_versions WHERE id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+        conn.commit()
+        return _resume_version_row_to_dict(row)
+
+
+def _interview_review_row_to_dict(row: sqlite3.Row) -> dict:
+    result = _with_display_times(dict(row))
+    result["occurred_at"] = format_datetime_for_display(result.get("occurred_at"))
+    for field in ("questions_json", "missing_skills_json"):
+        raw = result.pop(field, "[]")
+        try:
+            result[field.removesuffix("_json")] = json.loads(raw or "[]")
+        except (TypeError, json.JSONDecodeError):
+            result[field.removesuffix("_json")] = []
+    return result
+
+
+def _review_target(conn: sqlite3.Connection, job_target_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT id, report_id, status FROM job_targets WHERE id = ?", (job_target_id,)
+    ).fetchone()
+
+
+def create_interview_review(job_target_id: int, payload: InterviewReviewCreate) -> dict:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        target = _review_target(conn, job_target_id)
+        if target is None:
+            raise ValueError("投递目标不存在")
+        if target["status"] not in {"interview", "offer", "rejected"}:
+            raise ValueError("只有进入面试或面试后的岗位可以创建复盘")
+        occurred_at = payload.occurred_at.isoformat() if payload.occurred_at else None
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO interview_reviews
+                    (job_target_id, report_id, round_number, occurred_at, questions_json,
+                     performance, feedback, result, missing_skills_json, conclusion)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (job_target_id, target["report_id"], payload.round_number, occurred_at,
+                 json.dumps(payload.questions, ensure_ascii=False), payload.performance,
+                 payload.feedback, payload.result, json.dumps(payload.missing_skills, ensure_ascii=False),
+                 payload.conclusion),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("该岗位的面试轮次已存在") from exc
+        row = conn.execute("SELECT * FROM interview_reviews WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        conn.commit()
+        return _interview_review_row_to_dict(row)
+
+
+def list_interview_reviews(job_target_id: int) -> list[dict] | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        if _review_target(conn, job_target_id) is None:
+            return None
+        rows = conn.execute(
+            "SELECT * FROM interview_reviews WHERE job_target_id = ? ORDER BY round_number, id",
+            (job_target_id,),
+        ).fetchall()
+        return [_interview_review_row_to_dict(row) for row in rows]
+
+
+def update_interview_review(review_id: int, payload: InterviewReviewUpdate) -> dict | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        current = conn.execute("SELECT * FROM interview_reviews WHERE id = ?", (review_id,)).fetchone()
+        if current is None:
+            return None
+        values = {
+            "round_number": payload.round_number if payload.round_number is not None else current["round_number"],
+            "occurred_at": payload.occurred_at.isoformat() if payload.occurred_at else current["occurred_at"],
+            "questions_json": json.dumps(payload.questions, ensure_ascii=False) if payload.questions is not None else current["questions_json"],
+            "performance": payload.performance or current["performance"],
+            "feedback": payload.feedback if payload.feedback is not None else current["feedback"],
+            "result": payload.result or current["result"],
+            "missing_skills_json": json.dumps(payload.missing_skills, ensure_ascii=False) if payload.missing_skills is not None else current["missing_skills_json"],
+            "conclusion": payload.conclusion if payload.conclusion is not None else current["conclusion"],
+        }
+        try:
+            conn.execute(
+                """
+                UPDATE interview_reviews SET round_number = ?, occurred_at = ?, questions_json = ?,
+                    performance = ?, feedback = ?, result = ?, missing_skills_json = ?, conclusion = ?,
+                    updated_at = CURRENT_TIMESTAMP WHERE id = ?
+                """,
+                (*values.values(), review_id),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("该岗位的面试轮次已存在") from exc
+        row = conn.execute("SELECT * FROM interview_reviews WHERE id = ?", (review_id,)).fetchone()
+        conn.commit()
+        return _interview_review_row_to_dict(row)
+
+
+def confirm_interview_actions(review_id: int, skills: list[str]) -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        review = conn.execute("SELECT * FROM interview_reviews WHERE id = ?", (review_id,)).fetchone()
+        if review is None:
+            raise ValueError("面试复盘不存在")
+        try:
+            missing = json.loads(review["missing_skills_json"] or "[]")
+        except json.JSONDecodeError:
+            missing = []
+        chosen = list(dict.fromkeys(skill.strip() for skill in (skills or missing) if skill.strip()))
+        if not chosen:
+            raise ValueError("至少确认一项待补能力")
+        invalid = set(chosen) - set(missing)
+        if invalid:
+            raise ValueError("只能将本次复盘记录的待补能力转为行动项")
+        target = conn.execute("SELECT report_id FROM job_targets WHERE id = ?", (review["job_target_id"],)).fetchone()
+        if target is None:
+            raise ValueError("投递目标不存在")
+    items = create_action_items_from_report(
+        int(target["report_id"]), ActionItemsFromReportRequest(skills=chosen)
+    )
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE interview_reviews SET actions_confirmed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (review_id,))
+        conn.commit()
+    return items
+
+
+def get_job_target_timeline(job_target_id: int) -> dict | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        target = conn.execute("SELECT * FROM job_targets WHERE id = ?", (job_target_id,)).fetchone()
+        if target is None:
+            return None
+        events = conn.execute(
+            "SELECT id, job_target_id, event_type, occurred_at, note FROM application_events WHERE job_target_id = ? ORDER BY occurred_at, id",
+            (job_target_id,),
+        ).fetchall()
+        reviews = conn.execute(
+            "SELECT * FROM interview_reviews WHERE job_target_id = ? ORDER BY round_number, id",
+            (job_target_id,),
+        ).fetchall()
+        return {
+            "target": _job_target_row_to_dict(target),
+            "events": [_with_display_times(dict(row)) for row in events],
+            "interview_reviews": [_interview_review_row_to_dict(row) for row in reviews],
+        }
