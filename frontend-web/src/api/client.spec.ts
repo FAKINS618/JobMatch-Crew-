@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { apiFetch, resolveApiUrl } from "./client";
 import { submitEvidenceFeedback } from "./copilot";
+import { createInterviewReview, getJobTargetTimeline, updateResumeSuggestion } from "./workspace";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -77,5 +78,33 @@ describe("apiFetch", () => {
     await expect(
       submitEvidenceFeedback(7, { requirement_id: "req-1", verdict: "rejected" }),
     ).rejects.toMatchObject({ message: "证据不存在", status: 422 });
+  });
+});
+
+describe("application loop API", () => {
+  it("loads a target timeline and updates a resume suggestion", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ target: { id: 4 }, events: [], interview_reviews: [] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 8, status: "accepted" }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getJobTargetTimeline(4)).resolves.toMatchObject({ target: { id: 4 } });
+    await expect(updateResumeSuggestion(8, { status: "accepted", edited_text: "" })).resolves.toMatchObject({ status: "accepted" });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/resumes/suggestions/8", expect.objectContaining({ method: "PATCH" }));
+  });
+
+  it("submits a structured interview review", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: 2, round_number: 1 }), { status: 201 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(createInterviewReview(4, {
+      round_number: 1,
+      questions: ["缓存"],
+      performance: "mixed",
+      feedback: "补充实践",
+      result: "pending",
+      missing_skills: ["Docker"],
+      conclusion: "继续准备",
+    })).resolves.toMatchObject({ round_number: 1 });
+    expect(fetchMock).toHaveBeenCalledWith("/api/job-targets/4/interview-reviews", expect.objectContaining({ method: "POST" }));
   });
 });
