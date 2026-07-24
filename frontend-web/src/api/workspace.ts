@@ -24,6 +24,8 @@ export interface JobTarget {
   status: "saved" | "applied" | "written_test" | "interview" | "offer" | "rejected" | "withdrawn";
   note: string;
   created_at: string;
+  updated_at?: string;
+  deadline_at?: string | null;
 }
 
 export interface ReportSummary {
@@ -264,5 +266,129 @@ export function updateJobTarget(itemId: number, status: JobTarget["status"], not
   return apiFetch<JobTarget>(`/api/job-targets/${itemId}`, {
     method: "PATCH",
     body: JSON.stringify({ status, note }),
+  });
+}
+
+export interface ResumeSuggestion {
+  id: number;
+  report_id: number;
+  resume_version_id: number;
+  suggestion_type: string;
+  source_context: string;
+  suggested_text: string;
+  edited_text: string;
+  status: "pending" | "accepted" | "rejected" | "edited";
+  created_at: string | null;
+  updated_at: string | null;
+  confirmed_at: string | null;
+}
+
+export interface ApplicationEvent {
+  id: number;
+  job_target_id: number;
+  event_type: string;
+  occurred_at: string;
+  note: string;
+}
+
+export interface InterviewReview {
+  id: number;
+  job_target_id: number;
+  report_id: number;
+  round_number: number;
+  occurred_at: string | null;
+  questions: string[];
+  performance: "strong" | "mixed" | "needs_work";
+  feedback: string;
+  result: "pending" | "passed" | "failed" | "unknown";
+  missing_skills: string[];
+  conclusion: string;
+  actions_confirmed_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface JobTargetTimeline {
+  target: JobTarget;
+  events: ApplicationEvent[];
+  interview_reviews: InterviewReview[];
+}
+
+export function getJobTargetTimeline(targetId: number) {
+  return apiFetch<JobTargetTimeline>(`/api/job-targets/${targetId}/timeline`);
+}
+
+export function createApplicationEvent(targetId: number, payload: { event_type: string; note: string }) {
+  return apiFetch<ApplicationEvent>(`/api/job-targets/${targetId}/events`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function createInterviewReview(targetId: number, payload: {
+  round_number: number;
+  occurred_at?: string | null;
+  questions: string[];
+  performance: InterviewReview["performance"];
+  feedback: string;
+  result: InterviewReview["result"];
+  missing_skills: string[];
+  conclusion: string;
+}) {
+  return apiFetch<InterviewReview>(`/api/job-targets/${targetId}/interview-reviews`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateInterviewReview(reviewId: number, payload: Partial<{
+  round_number: number;
+  occurred_at: string | null;
+  questions: string[];
+  performance: InterviewReview["performance"];
+  feedback: string;
+  result: InterviewReview["result"];
+  missing_skills: string[];
+  conclusion: string;
+}>) {
+  return apiFetch<InterviewReview>(`/api/job-targets/interview-reviews/${reviewId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function confirmInterviewActions(reviewId: number, skills: string[]) {
+  return apiFetch<ActionItem[]>(`/api/job-targets/interview-reviews/${reviewId}/actions`, {
+    method: "POST",
+    body: JSON.stringify({ skills }),
+  });
+}
+
+export function listResumeSuggestions(reportId: number) {
+  return apiFetch<ResumeSuggestion[]>(`/api/resumes/suggestions/report/${reportId}`);
+}
+
+export function updateResumeSuggestion(
+  suggestionId: number,
+  payload: { status: ResumeSuggestion["status"]; edited_text: string },
+) {
+  return apiFetch<ResumeSuggestion>(`/api/resumes/suggestions/${suggestionId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function createResumeVersionFromSuggestions(payload: {
+  report_id: number;
+  source_resume_version_id: number;
+  suggestion_ids: number[];
+  version_name: string;
+  target_role: string;
+  raw_text: string;
+  profile: ResumeProfile;
+}) {
+  return apiFetch<ResumeVersion>("/api/resumes/versions/from-suggestions", {
+    method: "POST",
+    body: JSON.stringify(payload),
   });
 }
